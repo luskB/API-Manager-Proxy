@@ -287,6 +287,15 @@ const en = {
   "settings.authAllExceptHealth": "All Except Health",
   "settings.adminPassword": "Admin Password (optional)",
   "settings.adminPasswordPlaceholder": "Falls back to API Key if empty",
+  "settings.desktop": "Desktop",
+  "settings.closeBehavior": "When closing window",
+  "settings.closeBehaviorQuit": "Quit the app",
+  "settings.closeBehaviorTray": "Hide to system tray",
+  "settings.closeBehaviorHint":
+    "Choose whether clicking the close button exits APIManager or keeps it running in the tray.",
+  "settings.launchOnStartup": "Launch on system startup",
+  "settings.launchOnStartupHint":
+    "Create a Windows startup entry so APIManager opens automatically after sign-in.",
   "settings.network": "Network",
   "settings.allowLan": "Allow LAN Access (bind to 0.0.0.0)",
   "settings.requestTimeout": "Request Timeout (seconds)",

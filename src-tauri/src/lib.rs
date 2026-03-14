@@ -5,27 +5,50 @@ pub mod models;
 pub mod modules;
 pub mod proxy;
 
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
 use commands::ProxyServiceState;
-use tauri::Manager;
+use tauri::{
+    menu::{MenuBuilder, MenuItemBuilder},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    Manager, WindowEvent,
+};
+
+#[derive(Default)]
+struct AppLifecycleState {
+    allow_exit: Arc<AtomicBool>,
+}
+
+impl AppLifecycleState {
+    fn request_exit(&self) {
+        self.allow_exit.store(true, Ordering::SeqCst);
+    }
+
+    fn consume_exit_request(&self) -> bool {
+        self.allow_exit.swap(false, Ordering::SeqCst)
+    }
+}
 
 pub fn run() {
-    // Initialize logger first
     modules::logger::init_logger();
 
-    // Check for --headless mode
     let is_headless = std::env::args().any(|arg| arg == "--headless");
-
     if is_headless {
         run_headless();
         return;
     }
 
-    // GUI mode: Tauri application
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(ProxyServiceState::new())
+        .manage(AppLifecycleState::default())
         .setup(|app| {
+            setup_tray(app)?;
+
             let state = app.state::<ProxyServiceState>().inner().clone();
             tauri::async_runtime::spawn(async move {
                 let config = modules::config::load_app_config();
@@ -63,6 +86,19 @@ pub fn run() {
                 }
             });
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                let lifecycle = window.app_handle().state::<AppLifecycleState>();
+                if lifecycle.consume_exit_request() {
+                    return;
+                }
+
+                if should_hide_to_tray() {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             commands::import_backup,
@@ -106,15 +142,62 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
+fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
+    let show = MenuItemBuilder::with_id("show", "Show APIManager").build(app)?;
+    let quit = MenuItemBuilder::with_id("quit", "Quit APIManager").build(app)?;
+    let menu = MenuBuilder::new(app).items(&[&show, &quit]).build()?;
+
+    TrayIconBuilder::with_id("main-tray")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" => show_main_window(app),
+            "quit" => quit_application(app),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        })
+        .build(app)?;
+
+    Ok(())
+}
+
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+fn quit_application(app: &tauri::AppHandle) {
+    let lifecycle = app.state::<AppLifecycleState>();
+    lifecycle.request_exit();
+    app.exit(0);
+}
+
+fn should_hide_to_tray() -> bool {
+    matches!(
+        modules::config::load_app_config().desktop.close_behavior,
+        models::CloseBehavior::Tray
+    )
+}
+
 fn run_headless() {
     tracing::info!("Starting APIManager in headless mode...");
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     rt.block_on(async {
-        // Load config
         let mut config = modules::config::load_app_config();
 
-        // Environment variable overrides
         if let Ok(key) = std::env::var("ABV_API_KEY").or_else(|_| std::env::var("API_KEY")) {
             config.proxy.api_key = key;
         }
@@ -137,13 +220,12 @@ fn run_headless() {
             };
         }
 
-        // Headless defaults
         if let Ok(val) = std::env::var("ABV_BIND_LOCAL_ONLY") {
             if val == "true" || val == "1" {
                 config.proxy.allow_lan_access = false;
             }
         } else {
-            config.proxy.allow_lan_access = true; // Docker default
+            config.proxy.allow_lan_access = true;
         }
 
         tracing::info!(
@@ -155,7 +237,6 @@ fn run_headless() {
             "Headless configuration loaded"
         );
 
-        // Start proxy server using AxumServer
         match proxy::server::start_server(&config.proxy, &config.proxy_accounts).await {
             Ok(mut server) => {
                 tracing::info!(
@@ -164,7 +245,6 @@ fn run_headless() {
                     config.proxy.port
                 );
 
-                // Wait for Ctrl-C
                 tokio::signal::ctrl_c()
                     .await
                     .expect("Failed to listen for ctrl-c");

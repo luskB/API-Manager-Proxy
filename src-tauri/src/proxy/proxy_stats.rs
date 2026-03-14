@@ -163,6 +163,7 @@ pub struct ProxyStatsData {
 
 fn accumulate_account_stats(target: &mut AccountStats, event: &StatsEvent) {
     let is_success = event.status >= 200 && event.status < 400;
+    let effective_cost = event_effective_cost(event);
     target.total_requests += 1;
     if is_success {
         target.success_count += 1;
@@ -171,12 +172,26 @@ fn accumulate_account_stats(target: &mut AccountStats, event: &StatsEvent) {
     }
     target.total_input_tokens += event.input_tokens;
     target.total_output_tokens += event.output_tokens;
-    target.total_estimated_cost += event.estimated_cost;
+    target.total_estimated_cost += effective_cost;
     target.total_duration_ms += event.duration_ms;
 }
 
 fn event_total_tokens(event: &StatsEvent) -> u64 {
     (event.input_tokens + event.output_tokens).max(0) as u64
+}
+
+fn event_effective_cost(event: &StatsEvent) -> f64 {
+    if event.estimated_cost > 0.0 {
+        return event.estimated_cost;
+    }
+
+    let Some(model) = event.model.as_deref().filter(|value| !value.is_empty()) else {
+        return event.estimated_cost;
+    };
+
+    crate::proxy::price_cache::global()
+        .estimate_cost(model, event.input_tokens as i32, event.output_tokens as i32)
+        .unwrap_or(event.estimated_cost)
 }
 
 // ---------------------------------------------------------------------------
@@ -367,7 +382,7 @@ impl StatsAccumulator {
             if let Some(api_key) = event.api_key.as_ref().filter(|value| !value.is_empty()) {
                 let entry = per_key.entry(api_key.clone()).or_insert_with(WindowKeyStats::default);
                 entry.total_requests += 1;
-                entry.total_cost += event.estimated_cost;
+                entry.total_cost += event_effective_cost(event);
             }
 
             let bucket_ts = (event.timestamp / bucket_size) * bucket_size;
@@ -380,7 +395,7 @@ impl StatsAccumulator {
                 bucket.success_count += 1;
             }
             bucket.total_tokens += event_total_tokens(event);
-            bucket.total_cost += event.estimated_cost;
+            bucket.total_cost += event_effective_cost(event);
         }
 
         let mut timeline: Vec<TimelineBucket> = timeline_map.into_values().collect();
@@ -455,10 +470,10 @@ impl StatsAccumulator {
             .as_secs() as i64;
         // Start of today (UTC)
         let today_start = (now / 86400) * 86400;
-        data.hourly_buckets
+        data.recent_events
             .iter()
-            .filter(|b| b.hour >= today_start)
-            .map(|b| b.total_cost)
+            .filter(|event| event.timestamp >= today_start)
+            .map(event_effective_cost)
             .sum()
     }
 

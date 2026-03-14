@@ -1,7 +1,7 @@
-//! Global model price cache — fetches pricing from models.dev/api.json.
+//! Global model price cache fetched from models.dev.
 //!
 //! Startup: fetch once. Refresh every 24h (checked in auto_cleanup timer).
-//! Network failure is completely silent — no impact on proxy functionality.
+//! Network failure is completely silent and does not affect proxying.
 
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 const PRICE_API_URL: &str = "https://models.dev/api.json";
 const REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const COST_PER_MILLION_TOKENS: f64 = 1_000_000.0;
 
 /// Cost per token for a model.
 #[derive(Debug, Clone)]
@@ -18,20 +19,26 @@ pub struct ModelPrice {
     pub output_cost_per_token: f64,
 }
 
-/// Raw response shape from models.dev/api.json.
-/// Each provider has a map of model_name -> pricing info.
 #[derive(Debug, Deserialize)]
-struct ModelsDevEntry {
+struct ProviderEntry {
     #[serde(default)]
-    pricing: Option<PricingInfo>,
+    models: HashMap<String, ModelsDevModelEntry>,
 }
 
 #[derive(Debug, Deserialize)]
-struct PricingInfo {
+struct ModelsDevModelEntry {
     #[serde(default)]
-    prompt: Option<String>,
+    id: Option<String>,
     #[serde(default)]
-    completion: Option<String>,
+    cost: Option<ModelCost>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelCost {
+    #[serde(default)]
+    input: Option<f64>,
+    #[serde(default)]
+    output: Option<f64>,
 }
 
 pub struct PriceCache {
@@ -83,7 +90,7 @@ impl PriceCache {
             }
         };
 
-        let body: HashMap<String, ModelsDevEntry> = match resp.json().await {
+        let body: HashMap<String, ProviderEntry> = match resp.json().await {
             Ok(b) => b,
             Err(e) => {
                 tracing::debug!(error = %e, "Failed to parse price data JSON");
@@ -91,32 +98,7 @@ impl PriceCache {
             }
         };
 
-        let mut prices = HashMap::new();
-        for (model_name, entry) in &body {
-            if let Some(ref pricing) = entry.pricing {
-                let input = pricing
-                    .prompt
-                    .as_deref()
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(0.0);
-                let output = pricing
-                    .completion
-                    .as_deref()
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(0.0);
-
-                if input > 0.0 || output > 0.0 {
-                    prices.insert(
-                        model_name.to_lowercase(),
-                        ModelPrice {
-                            input_cost_per_token: input,
-                            output_cost_per_token: output,
-                        },
-                    );
-                }
-            }
-        }
-
+        let prices = extract_prices(&body);
         let count = prices.len();
         if count > 0 {
             if let Ok(mut guard) = self.prices.write() {
@@ -138,15 +120,94 @@ impl PriceCache {
         output_tokens: i32,
     ) -> Option<f64> {
         let guard = self.prices.read().ok()?;
-        let price = guard.get(&model.to_lowercase())?;
-        let cost = price.input_cost_per_token * input_tokens as f64
-            + price.output_cost_per_token * output_tokens as f64;
-        Some(cost)
+        for candidate in model_lookup_candidates(model) {
+            if let Some(price) = guard.get(&candidate) {
+                let cost = price.input_cost_per_token * input_tokens as f64
+                    + price.output_cost_per_token * output_tokens as f64;
+                return Some(cost);
+            }
+        }
+        None
     }
 
     /// Check if the cache has any prices loaded.
     pub fn is_empty(&self) -> bool {
         self.prices.read().map(|g| g.is_empty()).unwrap_or(true)
+    }
+}
+
+fn extract_prices(body: &HashMap<String, ProviderEntry>) -> HashMap<String, ModelPrice> {
+    let mut prices = HashMap::new();
+
+    for provider in body.values() {
+        for (model_name, entry) in &provider.models {
+            let Some(cost) = &entry.cost else {
+                continue;
+            };
+
+            let input = cost.input.unwrap_or(0.0) / COST_PER_MILLION_TOKENS;
+            let output = cost.output.unwrap_or(0.0) / COST_PER_MILLION_TOKENS;
+            if input <= 0.0 && output <= 0.0 {
+                continue;
+            }
+
+            let normalized_name = entry
+                .id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(model_name)
+                .to_lowercase();
+
+            prices.entry(normalized_name).or_insert(ModelPrice {
+                input_cost_per_token: input,
+                output_cost_per_token: output,
+            });
+        }
+    }
+
+    prices
+}
+
+fn model_lookup_candidates(model: &str) -> Vec<String> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    push_candidate(&mut candidates, trimmed);
+
+    if let Some((_, raw_model)) = trimmed.split_once("::") {
+        push_candidate(&mut candidates, raw_model);
+    }
+
+    if let Some(stripped) = trimmed.strip_prefix("models/") {
+        push_candidate(&mut candidates, stripped);
+        if let Some((base, _)) = stripped.split_once(':') {
+            push_candidate(&mut candidates, base);
+        }
+    }
+
+    if let Some((base, _)) = trimmed.split_once(':') {
+        push_candidate(&mut candidates, base);
+    }
+
+    if trimmed.starts_with('[') {
+        if let Some(closing) = trimmed.find(']') {
+            let remainder = trimmed[closing + 1..].trim();
+            if !remainder.is_empty() {
+                push_candidate(&mut candidates, remainder);
+            }
+        }
+    }
+
+    candidates
+}
+
+fn push_candidate(target: &mut Vec<String>, value: &str) {
+    let normalized = value.trim().to_lowercase();
+    if !normalized.is_empty() && !target.iter().any(|item| item == &normalized) {
+        target.push(normalized);
     }
 }
 
@@ -194,5 +255,58 @@ mod tests {
     fn needs_refresh_initially() {
         let cache = PriceCache::new();
         assert!(cache.needs_refresh());
+    }
+
+    #[test]
+    fn extract_prices_reads_nested_provider_models() {
+        let body: HashMap<String, ProviderEntry> = serde_json::from_str(
+            r#"{
+              "openai": {
+                "models": {
+                  "gpt-4o-mini": {
+                    "id": "gpt-4o-mini",
+                    "cost": { "input": 0.15, "output": 0.6 }
+                  }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let prices = extract_prices(&body);
+        let price = prices.get("gpt-4o-mini").unwrap();
+        assert!((price.input_cost_per_token - 0.15 / 1_000_000.0).abs() < 1e-12);
+        assert!((price.output_cost_per_token - 0.6 / 1_000_000.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn estimate_cost_matches_prefixed_and_gemini_model_variants() {
+        let cache = PriceCache::new();
+        {
+            let mut guard = cache.prices.write().unwrap();
+            guard.insert(
+                "gpt-5.2".to_string(),
+                ModelPrice {
+                    input_cost_per_token: 1.0,
+                    output_cost_per_token: 2.0,
+                },
+            );
+            guard.insert(
+                "gemini-2.5-pro".to_string(),
+                ModelPrice {
+                    input_cost_per_token: 3.0,
+                    output_cost_per_token: 4.0,
+                },
+            );
+        }
+
+        assert_eq!(
+            cache.estimate_cost("光速API::gpt-5.2", 2, 3),
+            Some(8.0)
+        );
+        assert_eq!(
+            cache.estimate_cost("models/gemini-2.5-pro:generateContent", 1, 1),
+            Some(7.0)
+        );
     }
 }

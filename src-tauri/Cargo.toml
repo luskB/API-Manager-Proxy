@@ -1,6 +1,6 @@
 [package]
 name = "apimanager"
-version = "1.0.0"
+version = "1.1.0"
 description = "AI API Hub Manager - Multi-site API aggregation proxy"
 authors = ["All API Hub"]
 license = "MIT"

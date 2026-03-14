@@ -72,8 +72,14 @@ export interface ProxyConfig {
   };
 }
 
+export interface DesktopConfig {
+  close_behavior: "quit" | "tray";
+  launch_on_startup: boolean;
+}
+
 export interface AppConfig {
   proxy: ProxyConfig;
+  desktop: DesktopConfig;
   accounts: SiteAccount[];
   proxy_accounts: SiteAccount[];
 }

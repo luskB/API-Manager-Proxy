@@ -2,6 +2,7 @@ pub mod backup;
 pub mod browser_login;
 pub mod browser_storage;
 pub mod config;
+pub mod desktop;
 pub mod hub_service;
 pub mod integration;
 pub mod logger;

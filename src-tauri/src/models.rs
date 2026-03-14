@@ -243,6 +243,40 @@ fn generate_api_key() -> String {
 }
 
 // ============================================================================
+// DesktopConfig
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseBehavior {
+    Quit,
+    Tray,
+}
+
+impl Default for CloseBehavior {
+    fn default() -> Self {
+        Self::Quit
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesktopConfig {
+    #[serde(default)]
+    pub close_behavior: CloseBehavior,
+    #[serde(default)]
+    pub launch_on_startup: bool,
+}
+
+impl Default for DesktopConfig {
+    fn default() -> Self {
+        Self {
+            close_behavior: CloseBehavior::default(),
+            launch_on_startup: false,
+        }
+    }
+}
+
+// ============================================================================
 // Account Models (unchanged from architecture doc)
 // ============================================================================
 
@@ -372,6 +406,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub proxy: ProxyConfig,
 
+    /// Desktop application preferences
+    #[serde(default)]
+    pub desktop: DesktopConfig,
+
     /// All imported accounts
     #[serde(default)]
     pub accounts: Vec<SiteAccount>,
@@ -385,6 +423,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             proxy: ProxyConfig::default(),
+            desktop: DesktopConfig::default(),
             accounts: Vec::new(),
             proxy_accounts: Vec::new(),
         }

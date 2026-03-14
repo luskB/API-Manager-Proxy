@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { AppConfig } from "../types/backup";
-import { Save, Shield, Globe, ArrowUpRight, FileText, DollarSign, Route, Plus, Trash2, Key, Eye, EyeOff, X, ChevronDown } from "lucide-react";
+import { Save, Shield, Globe, ArrowUpRight, FileText, DollarSign, Route, Plus, Trash2, Key, Eye, EyeOff, X, ChevronDown, Monitor } from "lucide-react";
 import { useConfig } from "../hooks/useConfig";
 import PageSkeleton from "../components/PageSkeleton";
 import { useBeforeUnload } from "react-router-dom";
@@ -197,6 +197,68 @@ export default function SettingsPage() {
                 })
               }
             />
+          </div>
+        </div>
+      </div>
+
+      {/* Desktop */}
+      <div className="card bg-base-100 border border-base-300">
+        <div className="card-body">
+          <h2 className="card-title text-sm gap-2">
+            <Monitor size={16} />
+            {t("settings.desktop")}
+          </h2>
+
+          <div className="form-control mt-2">
+            <label className="label">
+              <span className="label-text">{t("settings.closeBehavior")}</span>
+            </label>
+            <select
+              className="select select-bordered select-sm"
+              value={config.desktop.close_behavior}
+              onChange={(e) =>
+                setConfig({
+                  ...config,
+                  desktop: {
+                    ...config.desktop,
+                    close_behavior: e.target.value as AppConfig["desktop"]["close_behavior"],
+                  },
+                })
+              }
+            >
+              <option value="quit">{t("settings.closeBehaviorQuit")}</option>
+              <option value="tray">{t("settings.closeBehaviorTray")}</option>
+            </select>
+            <label className="label">
+              <span className="label-text-alt text-base-content/50">
+                {t("settings.closeBehaviorHint")}
+              </span>
+            </label>
+          </div>
+
+          <div className="form-control mt-2">
+            <label className="label cursor-pointer justify-start gap-3">
+              <input
+                type="checkbox"
+                className="toggle toggle-sm toggle-primary"
+                checked={config.desktop.launch_on_startup}
+                onChange={(e) =>
+                  setConfig({
+                    ...config,
+                    desktop: {
+                      ...config.desktop,
+                      launch_on_startup: e.target.checked,
+                    },
+                  })
+                }
+              />
+              <span className="label-text">{t("settings.launchOnStartup")}</span>
+            </label>
+            <label className="label pt-0">
+              <span className="label-text-alt text-base-content/50">
+                {t("settings.launchOnStartupHint")}
+              </span>
+            </label>
           </div>
         </div>
       </div>

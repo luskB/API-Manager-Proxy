@@ -6,7 +6,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::models::{AppConfig, SiteAccount};
-use crate::modules::{backup, browser_login, browser_storage, config, hub_service};
+use crate::modules::{backup, browser_login, browser_storage, config, desktop, hub_service};
 use crate::proxy::key_fetcher::{has_usable_api_key, populate_api_keys_for_accounts, ApiKeyFetchScope};
 use crate::proxy::middleware::SecurityConfig;
 use crate::proxy::monitor::ProxyMonitor;
@@ -476,6 +476,7 @@ pub async fn save_config(
     let normalized = config::normalized_app_config(&normalized);
 
     config::save_app_config(&normalized)?;
+    desktop::sync_launch_on_startup(normalized.desktop.launch_on_startup)?;
     sync_running_proxy_config(&state, &normalized).await;
     Ok(())
 }
