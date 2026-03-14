@@ -1,6 +1,6 @@
 [package]
 name = "apimanager"
-version = "1.1.0"
+version = "1.1.1"
 description = "AI API Hub Manager - Multi-site API aggregation proxy"
 authors = ["All API Hub"]
 license = "MIT"
@@ -69,6 +69,13 @@ once_cell = "1.19"
 
 # LevelDB (for reading Chrome extension storage)
 rusty-leveldb = "4"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_Threading",
+  "Win32_UI_WindowsAndMessaging",
+] }
 
 [features]
 default = ["custom-protocol"]

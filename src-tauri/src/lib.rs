@@ -12,6 +12,7 @@ use std::sync::{
 
 use commands::ProxyServiceState;
 use tauri::{
+    image::Image,
     menu::{MenuBuilder, MenuItemBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Manager, WindowEvent,
@@ -40,6 +41,15 @@ pub fn run() {
         run_headless();
         return;
     }
+
+    let _single_instance_guard = match modules::single_instance::acquire_single_instance_guard() {
+        Ok(Some(guard)) => guard,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::error!("Failed to initialize single-instance guard: {}", error);
+            return;
+        }
+    };
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -147,8 +157,12 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     let quit = MenuItemBuilder::with_id("quit", "Quit APIManager").build(app)?;
     let menu = MenuBuilder::new(app).items(&[&show, &quit]).build()?;
 
-    TrayIconBuilder::with_id("main-tray")
-        .menu(&menu)
+    let mut builder = TrayIconBuilder::with_id("main-tray").menu(&menu);
+    if let Some(icon) = tray_icon_image(app) {
+        builder = builder.icon(icon);
+    }
+
+    builder
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "show" => show_main_window(app),
@@ -168,6 +182,14 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
         .build(app)?;
 
     Ok(())
+}
+
+fn tray_icon_image(app: &tauri::App) -> Option<Image<'static>> {
+    if let Some(icon) = app.default_window_icon() {
+        return Some(icon.clone().to_owned());
+    }
+
+    Image::from_bytes(include_bytes!("../icons/icon.png")).ok()
 }
 
 fn show_main_window(app: &tauri::AppHandle) {

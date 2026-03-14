@@ -8,4 +8,5 @@ pub mod integration;
 pub mod logger;
 pub mod scheduler;
 pub mod security_db;
+pub mod single_instance;
 pub mod token_stats;
