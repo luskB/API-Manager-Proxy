@@ -131,6 +131,27 @@ pub struct ScopedProxyStatsData {
     pub timeline: Vec<TimelineBucket>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TokenTimelineBucket {
+    pub timestamp: i64,
+    pub total_requests: u64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+    pub total_cost: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TokenStatsView {
+    pub scope: String,
+    pub window_start: i64,
+    pub window_end: i64,
+    pub summary: AccountStats,
+    pub per_account: HashMap<String, AccountStats>,
+    pub per_model: HashMap<String, AccountStats>,
+    pub timeline: Vec<TokenTimelineBucket>,
+}
+
 /// Per-key cost statistics for multi-user API key tracking.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PerKeyStats {
@@ -181,10 +202,6 @@ fn event_total_tokens(event: &StatsEvent) -> u64 {
 }
 
 fn event_effective_cost(event: &StatsEvent) -> f64 {
-    if event.estimated_cost > 0.0 {
-        return event.estimated_cost;
-    }
-
     let Some(model) = event.model.as_deref().filter(|value| !value.is_empty()) else {
         return event.estimated_cost;
     };
@@ -198,6 +215,10 @@ fn event_effective_cost(event: &StatsEvent) -> f64 {
         ) {
             return cost;
         }
+    }
+
+    if event.estimated_cost > 0.0 {
+        return event.estimated_cost;
     }
 
     crate::proxy::price_cache::global()
@@ -232,27 +253,23 @@ impl StatsAccumulator {
         let is_success = log.status >= 200 && log.status < 400;
         let input = log.input_tokens.unwrap_or(0) as i64;
         let output = log.output_tokens.unwrap_or(0) as i64;
-        let cost = log.estimated_cost.unwrap_or_else(|| {
-            log.account_id
-                .as_deref()
-                .and_then(|account_id| {
-                    log.model.as_deref().and_then(|model| {
-                        crate::proxy::site_price_cache::global().estimate_cost(
-                            account_id,
-                            model,
-                            input as i32,
-                            output as i32,
-                        )
-                    })
+        let cost = log
+            .account_id
+            .as_deref()
+            .and_then(|account_id| {
+                log.model.as_deref().and_then(|model| {
+                    crate::proxy::site_price_cache::global()
+                        .estimate_cost(account_id, model, input as i32, output as i32)
                 })
-                .or_else(|| {
-                    log.model.as_deref().and_then(|model| {
-                        crate::proxy::price_cache::global()
-                            .estimate_cost(model, input as i32, output as i32)
-                    })
+            })
+            .or(log.estimated_cost)
+            .or_else(|| {
+                log.model.as_deref().and_then(|model| {
+                    crate::proxy::price_cache::global()
+                        .estimate_cost(model, input as i32, output as i32)
                 })
-                .unwrap_or(0.0)
-        });
+            })
+            .unwrap_or(0.0);
 
         // Update global
         data.global.total_requests += 1;
@@ -444,6 +461,75 @@ impl StatsAccumulator {
             per_account,
             per_model,
             per_key,
+            timeline,
+        }
+    }
+
+    pub fn get_token_stats_view(&self, scope: StatsScope) -> TokenStatsView {
+        let now = chrono::Utc::now().timestamp();
+        let window_start = scope.retention_start(now);
+        let bucket_size = scope.bucket_size_secs();
+
+        let data = match self.data.read() {
+            Ok(d) => d,
+            Err(_) => {
+                return TokenStatsView {
+                    scope: match scope {
+                        StatsScope::Hourly => "hourly".to_string(),
+                        StatsScope::Daily => "daily".to_string(),
+                        StatsScope::Weekly => "weekly".to_string(),
+                    },
+                    window_start,
+                    window_end: now,
+                    ..Default::default()
+                };
+            }
+        };
+
+        let mut summary = AccountStats::default();
+        let mut per_account = HashMap::new();
+        let mut per_model = HashMap::new();
+        let mut timeline_map: HashMap<i64, TokenTimelineBucket> = HashMap::new();
+
+        for event in data.recent_events.iter().filter(|event| event.timestamp >= window_start) {
+            accumulate_account_stats(&mut summary, event);
+
+            if let Some(account_id) = event.account_id.as_ref().filter(|value| !value.is_empty()) {
+                accumulate_account_stats(per_account.entry(account_id.clone()).or_default(), event);
+            }
+
+            if let Some(model) = event.model.as_ref().filter(|value| !value.is_empty()) {
+                accumulate_account_stats(per_model.entry(model.clone()).or_default(), event);
+            }
+
+            let bucket_ts = (event.timestamp / bucket_size) * bucket_size;
+            let bucket = timeline_map
+                .entry(bucket_ts)
+                .or_insert_with(|| TokenTimelineBucket {
+                    timestamp: bucket_ts,
+                    ..Default::default()
+                });
+            bucket.total_requests += 1;
+            bucket.input_tokens += event.input_tokens;
+            bucket.output_tokens += event.output_tokens;
+            bucket.total_tokens += (event.input_tokens + event.output_tokens).max(0);
+            bucket.total_cost += event_effective_cost(event);
+        }
+
+        let mut timeline: Vec<TokenTimelineBucket> = timeline_map.into_values().collect();
+        timeline.sort_by_key(|bucket| bucket.timestamp);
+
+        TokenStatsView {
+            scope: match scope {
+                StatsScope::Hourly => "hourly".to_string(),
+                StatsScope::Daily => "daily".to_string(),
+                StatsScope::Weekly => "weekly".to_string(),
+            },
+            window_start,
+            window_end: now,
+            summary,
+            per_account,
+            per_model,
             timeline,
         }
     }

@@ -578,10 +578,19 @@ pub async fn get_proxy_status(
 pub async fn get_logs(
     state: tauri::State<'_, ProxyServiceState>,
 ) -> Result<serde_json::Value, String> {
+    refresh_site_price_cache_if_needed().await;
+    refresh_price_cache_if_needed().await;
     let monitor = state.monitor.read().await;
 
     if let Some(ref mon) = *monitor {
-        let logs = mon.get_logs(0, 100);
+        let logs: Vec<Value> = mon
+            .get_logs(0, 100)
+            .into_iter()
+            .map(|mut log| {
+                log.estimated_cost = crate::proxy::middleware::monitor::recompute_estimated_cost_from_log(&log);
+                serde_json::to_value(log).unwrap_or(Value::Null)
+            })
+            .collect();
         Ok(serde_json::json!({
             "total": mon.get_count(),
             "logs": logs,
@@ -799,10 +808,29 @@ pub async fn get_proxy_stats_view(scope: Option<String>) -> Result<serde_json::V
     serde_json::to_value(&stats).map_err(|e| format!("Failed to serialize scoped stats: {}", e))
 }
 
+#[tauri::command]
+pub async fn get_token_stats_view(scope: Option<String>) -> Result<serde_json::Value, String> {
+    refresh_site_price_cache_if_needed().await;
+    refresh_price_cache_if_needed().await;
+    let scope = scope
+        .as_deref()
+        .and_then(StatsScope::parse)
+        .unwrap_or(StatsScope::Daily);
+    let stats = crate::proxy::proxy_stats::global().get_token_stats_view(scope);
+    serde_json::to_value(&stats).map_err(|e| format!("Failed to serialize token stats: {}", e))
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProxyModelPriceQuote {
-    pub input_per_million: f64,
-    pub output_per_million: f64,
+    pub billing_mode: crate::proxy::site_price_cache::SiteModelBillingMode,
+    pub source_count: usize,
+    pub from_site_pricing: bool,
+    pub input_per_million: Option<f64>,
+    pub output_per_million: Option<f64>,
+    pub input_per_million_max: Option<f64>,
+    pub output_per_million_max: Option<f64>,
+    pub request_price: Option<f64>,
+    pub request_price_max: Option<f64>,
 }
 
 #[tauri::command]
@@ -833,22 +861,51 @@ pub async fn get_proxy_model_catalog(
 #[tauri::command(rename_all = "snake_case")]
 pub async fn get_proxy_model_prices(
     models: Vec<String>,
+    account_ids: Option<Vec<String>>,
 ) -> Result<HashMap<String, ProxyModelPriceQuote>, String> {
+    refresh_site_price_cache_if_needed().await;
     refresh_price_cache_if_needed().await;
 
-    let cache = crate::proxy::price_cache::global();
+    let site_cache = crate::proxy::site_price_cache::global();
+    let generic_cache = crate::proxy::price_cache::global();
+    let account_ids = account_ids.unwrap_or_default();
     let mut prices = HashMap::new();
     for model in models {
         let key = model.trim();
         if key.is_empty() || prices.contains_key(key) {
             continue;
         }
-        if let Some(price) = cache.get_price(key) {
+        if let Some(price) = site_cache.quote_model(&account_ids, key) {
             prices.insert(
                 key.to_string(),
                 ProxyModelPriceQuote {
-                    input_per_million: price.input_cost_per_token * 1_000_000.0,
-                    output_per_million: price.output_cost_per_token * 1_000_000.0,
+                    billing_mode: price.billing_mode,
+                    source_count: price.source_count,
+                    from_site_pricing: price.from_site_pricing,
+                    input_per_million: price.input_per_million,
+                    output_per_million: price.output_per_million,
+                    input_per_million_max: price.input_per_million_max,
+                    output_per_million_max: price.output_per_million_max,
+                    request_price: price.request_price,
+                    request_price_max: price.request_price_max,
+                },
+            );
+            continue;
+        }
+
+        if let Some(price) = generic_cache.get_price(key) {
+            prices.insert(
+                key.to_string(),
+                ProxyModelPriceQuote {
+                    billing_mode: crate::proxy::site_price_cache::SiteModelBillingMode::Tokens,
+                    source_count: 0,
+                    from_site_pricing: false,
+                    input_per_million: Some(price.input_cost_per_token * 1_000_000.0),
+                    output_per_million: Some(price.output_cost_per_token * 1_000_000.0),
+                    input_per_million_max: Some(price.input_cost_per_token * 1_000_000.0),
+                    output_per_million_max: Some(price.output_cost_per_token * 1_000_000.0),
+                    request_price: None,
+                    request_price_max: None,
                 },
             );
         }

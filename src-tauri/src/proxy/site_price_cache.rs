@@ -1,3 +1,4 @@
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
@@ -6,7 +7,7 @@ use std::time::{Duration, Instant};
 const REFRESH_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const QUOTA_PER_USD: f64 = 500_000.0;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BillingMode {
     Tokens,
     Requests,
@@ -17,6 +18,39 @@ struct SiteModelPrice {
     billing_mode: BillingMode,
     input_price: f64,
     output_price: f64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SiteModelBillingMode {
+    Tokens,
+    Requests,
+    Mixed,
+}
+
+impl Default for SiteModelBillingMode {
+    fn default() -> Self {
+        Self::Tokens
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SiteModelPriceQuote {
+    pub billing_mode: SiteModelBillingMode,
+    pub source_count: usize,
+    pub from_site_pricing: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_per_million: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_per_million: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_per_million_max: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_per_million_max: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_price: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_price_max: Option<f64>,
 }
 
 pub struct SitePriceCache {
@@ -64,20 +98,101 @@ impl SitePriceCache {
 
         for candidate in model_lookup_candidates(model) {
             if let Some(price) = account_prices.get(&candidate) {
-                let quota = match price.billing_mode {
+                let cost = match price.billing_mode {
+                    // Request-priced models already use the raw site pricing unit.
                     BillingMode::Requests => price.input_price.max(price.output_price),
                     BillingMode::Tokens => {
-                        price.input_price * input_tokens as f64 + price.output_price * output_tokens as f64
+                        (price.input_price * input_tokens as f64 + price.output_price * output_tokens as f64)
+                            / QUOTA_PER_USD
                     }
                 };
-                if quota > 0.0 {
-                    return Some(quota / QUOTA_PER_USD);
+                if cost > 0.0 {
+                    return Some(cost);
                 }
             }
         }
 
         None
     }
+
+    pub fn quote_model(
+        &self,
+        account_ids: &[String],
+        model: &str,
+    ) -> Option<SiteModelPriceQuote> {
+        let guard = self.prices.read().ok()?;
+        let mut matched_prices = Vec::new();
+
+        if account_ids.is_empty() {
+            for account_prices in guard.values() {
+                if let Some(price) = lookup_model_price(account_prices, model) {
+                    matched_prices.push(price.clone());
+                }
+            }
+        } else {
+            for account_id in account_ids {
+                let Some(account_prices) = guard.get(account_id) else {
+                    continue;
+                };
+                if let Some(price) = lookup_model_price(account_prices, model) {
+                    matched_prices.push(price.clone());
+                }
+            }
+        }
+
+        if matched_prices.is_empty() {
+            return None;
+        }
+
+        let request_prices: Vec<f64> = matched_prices
+            .iter()
+            .filter(|price| price.billing_mode == BillingMode::Requests)
+            .map(|price| price.input_price.max(price.output_price))
+            .filter(|price| *price > 0.0)
+            .collect();
+        let token_prices: Vec<(f64, f64)> = matched_prices
+            .iter()
+            .filter(|price| price.billing_mode == BillingMode::Tokens)
+            .map(|price| {
+                (
+                    price.input_price * 1_000_000.0 / QUOTA_PER_USD,
+                    price.output_price * 1_000_000.0 / QUOTA_PER_USD,
+                )
+            })
+            .filter(|(input, output)| *input > 0.0 || *output > 0.0)
+            .collect();
+
+        let billing_mode = match (!token_prices.is_empty(), !request_prices.is_empty()) {
+            (true, false) => SiteModelBillingMode::Tokens,
+            (false, true) => SiteModelBillingMode::Requests,
+            (true, true) => SiteModelBillingMode::Mixed,
+            (false, false) => return None,
+        };
+
+        Some(SiteModelPriceQuote {
+            billing_mode,
+            source_count: matched_prices.len(),
+            from_site_pricing: true,
+            input_per_million: token_prices.iter().map(|(input, _)| *input).reduce(f64::min),
+            output_per_million: token_prices.iter().map(|(_, output)| *output).reduce(f64::min),
+            input_per_million_max: token_prices.iter().map(|(input, _)| *input).reduce(f64::max),
+            output_per_million_max: token_prices.iter().map(|(_, output)| *output).reduce(f64::max),
+            request_price: request_prices.iter().copied().reduce(f64::min),
+            request_price_max: request_prices.iter().copied().reduce(f64::max),
+        })
+    }
+}
+
+fn lookup_model_price<'a>(
+    account_prices: &'a HashMap<String, SiteModelPrice>,
+    model: &str,
+) -> Option<&'a SiteModelPrice> {
+    for candidate in model_lookup_candidates(model) {
+        if let Some(price) = account_prices.get(&candidate) {
+            return Some(price);
+        }
+    }
+    None
 }
 
 fn parse_pricing_payload(payload: &Value) -> HashMap<String, SiteModelPrice> {
@@ -235,7 +350,7 @@ mod tests {
         );
 
         let cost = cache.estimate_cost("acc-1", "claude-opus-4.6", 0, 0).unwrap();
-        assert!((cost - 15.0 / QUOTA_PER_USD).abs() < 1e-12);
+        assert!((cost - 15.0).abs() < 1e-12);
     }
 
     #[test]
@@ -259,5 +374,29 @@ mod tests {
         let cost = cache.estimate_cost("acc-1", "站点A::gpt-5.2", 1000, 500).unwrap();
         let expected = (0.8 * 1000.0 + 2.0 * 500.0) / QUOTA_PER_USD;
         assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn quote_model_keeps_request_pricing_raw() {
+        let cache = SitePriceCache::new();
+        cache.set_account_pricing(
+            "acc-1",
+            &json!({
+                "data": {
+                    "claude-opus-4.6": {
+                        "quota_type": 1,
+                        "model_price": 1
+                    }
+                }
+            }),
+        );
+
+        let quote = cache
+            .quote_model(&["acc-1".to_string()], "claude-opus-4.6")
+            .unwrap();
+
+        assert_eq!(quote.billing_mode, SiteModelBillingMode::Requests);
+        assert_eq!(quote.request_price, Some(1.0));
+        assert_eq!(quote.request_price_max, Some(1.0));
     }
 }

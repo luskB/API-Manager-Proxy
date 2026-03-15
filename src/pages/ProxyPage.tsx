@@ -32,8 +32,15 @@ interface ProxyModelCatalogRow {
 }
 
 interface ProxyModelPriceQuote {
+  billing_mode: "tokens" | "requests" | "mixed";
+  source_count: number;
+  from_site_pricing: boolean;
   input_per_million: number;
   output_per_million: number;
+  input_per_million_max?: number | null;
+  output_per_million_max?: number | null;
+  request_price?: number | null;
+  request_price_max?: number | null;
 }
 
 type ProxyUserKey = NonNullable<AppConfig["proxy"]["api_keys"]>[number];
@@ -81,6 +88,28 @@ function formatUsdPerMillion(value: number): string {
   if (value >= 1) return value.toFixed(3);
   if (value >= 0.1) return value.toFixed(4);
   return value.toFixed(6);
+}
+
+function formatUsdValue(value: number): string {
+  if (value >= 10) return value.toFixed(2);
+  if (value >= 1) return value.toFixed(3);
+  if (value >= 0.1) return value.toFixed(4);
+  if (value >= 0.01) return value.toFixed(5);
+  return value.toFixed(6);
+}
+
+function formatRange(
+  minValue?: number | null,
+  maxValue?: number | null,
+  formatter: (value: number) => string = formatUsdValue,
+): string | null {
+  if (minValue == null && maxValue == null) return null;
+  const min = minValue ?? maxValue ?? 0;
+  const max = maxValue ?? minValue ?? min;
+  if (Math.abs(min - max) < 1e-9) {
+    return formatter(min);
+  }
+  return `${formatter(min)}-${formatter(max)}`;
 }
 
 export default function ProxyPage() {
@@ -154,14 +183,26 @@ export default function ProxyPage() {
   }, [config?.proxy_accounts]);
 
   useEffect(() => {
-    const models = dedupe(catalog.flatMap((row) => row.models));
+    if (!editorOpen) {
+      setModelPrices({});
+      return;
+    }
+
+    const rows =
+      editor.allowed_account_ids.length === 0
+        ? catalog
+        : catalog.filter((row) => editor.allowed_account_ids.includes(row.account_id));
+    const models = dedupe(rows.flatMap((row) => row.models));
     if (models.length === 0) {
       setModelPrices({});
       return;
     }
 
     let cancelled = false;
-    request<Record<string, ProxyModelPriceQuote>>("get_proxy_model_prices", { models })
+    request<Record<string, ProxyModelPriceQuote>>("get_proxy_model_prices", {
+      models,
+      account_ids: editor.allowed_account_ids,
+    })
       .then((prices) => {
         if (!cancelled) {
           setModelPrices(prices ?? {});
@@ -176,7 +217,7 @@ export default function ProxyPage() {
     return () => {
       cancelled = true;
     };
-  }, [catalog]);
+  }, [catalog, editor.allowed_account_ids, editorOpen]);
 
   const proxyKeys = config?.proxy.api_keys ?? [];
   const activeAccounts = config?.proxy_accounts.filter((a) => !a.disabled).length ?? 0;
@@ -326,7 +367,7 @@ export default function ProxyPage() {
     setModelSearch("");
   }
 
-  function priceTooltip(model: string): string {
+  function legacyPriceTooltip(model: string): string {
     const price = modelPrices[model];
     if (!price) {
       return text("Pricing unavailable", "Pricing unavailable");
@@ -335,6 +376,49 @@ export default function ProxyPage() {
       `输入 $${formatUsdPerMillion(price.input_per_million)}/1M · 输出 $${formatUsdPerMillion(price.output_per_million)}/1M`,
       `Input $${formatUsdPerMillion(price.input_per_million)}/1M · Output $${formatUsdPerMillion(price.output_per_million)}/1M`,
     );
+  }
+
+  function priceTooltip(model: string): string {
+    const price = modelPrices[model];
+    if (!price) {
+      return text("Pricing unavailable", "Pricing unavailable");
+    }
+    const requestRange = formatRange(price.request_price, price.request_price_max);
+    const inputRange = formatRange(price.input_per_million, price.input_per_million_max, formatUsdPerMillion);
+    const outputRange = formatRange(price.output_per_million, price.output_per_million_max, formatUsdPerMillion);
+    const sourcePrefix = price.from_site_pricing
+      ? price.source_count > 1
+        ? text(`已匹配 ${price.source_count} 个站点`, `${price.source_count} matched sites`)
+        : text("按站点真实定价", "Using site pricing")
+      : text("通用参考定价", "Generic reference pricing");
+
+    if (price.billing_mode === "requests" && requestRange) {
+      return text(
+        `${sourcePrefix} · $${requestRange}/次`,
+        `${sourcePrefix} · $${requestRange} / request`,
+      );
+    }
+
+    if (price.billing_mode === "mixed") {
+      const parts = [
+        requestRange ? text(`按次 $${requestRange}/次`, `Per request $${requestRange}/request`) : null,
+        inputRange && outputRange
+          ? text(`Token 输入 $${inputRange}/1M，输出 $${outputRange}/1M`, `Token input $${inputRange}/1M, output $${outputRange}/1M`)
+          : null,
+      ].filter(Boolean);
+      return parts.length > 0
+        ? `${sourcePrefix} · ${parts.join(" · ")}`
+        : text("Pricing varies by site", "Pricing varies by site");
+    }
+
+    if (inputRange || outputRange) {
+      return text(
+        `${sourcePrefix} · 输入 $${inputRange ?? "-"}/1M · 输出 $${outputRange ?? inputRange ?? "-"}/1M`,
+        `${sourcePrefix} · Input $${inputRange ?? "-"}/1M · Output $${outputRange ?? inputRange ?? "-"}/1M`,
+      );
+    }
+
+    return legacyPriceTooltip(model);
   }
 
   async function saveEditor() {

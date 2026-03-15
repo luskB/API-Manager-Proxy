@@ -4,6 +4,7 @@ import {
   Users,
   Server,
   Radio,
+  Coins,
   Activity,
   Settings,
 } from "lucide-react";
@@ -18,6 +19,7 @@ const navItems: { to: string; labelKey: TranslationKey; icon: typeof LayoutDashb
   { to: "/accounts", labelKey: "nav.accounts", icon: Users },
   { to: "/hub", labelKey: "nav.hub", icon: Server },
   { to: "/proxy", labelKey: "nav.proxy", icon: Radio },
+  { to: "/tokens", labelKey: "nav.tokens", icon: Coins },
   { to: "/monitor", labelKey: "nav.monitor", icon: Activity },
   { to: "/settings", labelKey: "nav.settings", icon: Settings },
 ];

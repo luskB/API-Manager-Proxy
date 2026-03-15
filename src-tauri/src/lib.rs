@@ -128,6 +128,7 @@ pub fn run() {
             commands::get_available_models,
             commands::get_proxy_stats,
             commands::get_proxy_stats_view,
+            commands::get_token_stats_view,
             commands::get_proxy_model_catalog,
             commands::get_proxy_model_prices,
             commands::validate_api_key,

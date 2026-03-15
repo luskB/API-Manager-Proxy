@@ -9,6 +9,7 @@ use futures::StreamExt;
 use http_body_util::BodyExt;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::mpsc;
 
 use crate::proxy::middleware::auth::AuthenticatedKey;
 use crate::proxy::monitor::{ProxyMonitor, ProxyRequestLog};
@@ -38,7 +39,7 @@ struct StreamLogContext {
     method: String,
     url: String,
     status: u16,
-    duration_ms: u64,
+    started_at: Instant,
     model: Option<String>,
     account_id: Option<String>,
     upstream_url: Option<String>,
@@ -104,7 +105,7 @@ pub async fn monitor_middleware(
                 method,
                 url,
                 status,
-                duration_ms,
+                started_at: start,
                 model: effective_model,
                 account_id: effective_account_id,
                 upstream_url,
@@ -165,17 +166,19 @@ fn wrap_sse_response(
     context: StreamLogContext,
 ) -> Response {
     let (parts, body) = response.into_parts();
-    let mut stream = body.into_data_stream();
+    let mut upstream_stream = body.into_data_stream();
+    let (tx, mut rx) = mpsc::channel::<Bytes>(32);
 
-    let forwarded = async_stream::stream! {
+    tokio::spawn(async move {
         let mut preview = BytesMut::new();
         let mut pending = Vec::new();
         let mut input_tokens = None;
         let mut output_tokens = None;
         let mut error_msg = None;
+        let mut client_disconnected = false;
 
-        while let Some(chunk_result) = stream.next().await {
-            match &chunk_result {
+        while let Some(chunk_result) = upstream_stream.next().await {
+            match chunk_result {
                 Ok(chunk) => {
                     let remaining = BODY_TRUNCATE_BYTES.saturating_sub(preview.len());
                     if remaining > 0 {
@@ -183,20 +186,23 @@ fn wrap_sse_response(
                     }
                     parse_sse_usage_incremental(
                         &mut pending,
-                        chunk,
+                        &chunk,
                         &mut input_tokens,
                         &mut output_tokens,
                         &mut error_msg,
                     );
+
+                    if !client_disconnected && tx.send(chunk).await.is_err() {
+                        client_disconnected = true;
+                    }
                 }
                 Err(error) => {
                     if error_msg.is_none() {
                         error_msg = Some(error.to_string());
                     }
+                    break;
                 }
             }
-
-            yield chunk_result;
         }
 
         if !pending.is_empty() {
@@ -220,7 +226,7 @@ fn wrap_sse_response(
             method: context.method,
             url: context.url,
             status: context.status,
-            duration_ms: context.duration_ms,
+            duration_ms: context.started_at.elapsed().as_millis() as u64,
             model: context.model.clone(),
             account_id: context.account_id.clone(),
             upstream_url: context.upstream_url,
@@ -242,6 +248,12 @@ fn wrap_sse_response(
 
         crate::proxy::proxy_stats::global().record(&log);
         monitor.add_log(log);
+    });
+
+    let forwarded = async_stream::stream! {
+        while let Some(chunk) = rx.recv().await {
+            yield Ok::<Bytes, std::io::Error>(chunk);
+        }
     };
 
     Response::from_parts(parts, Body::from_stream(forwarded))
@@ -346,6 +358,8 @@ fn parse_usage_and_error(bytes: &Bytes) -> (Option<i32>, Option<i32>, Option<Str
     parse_usage_and_error_value(&value)
 }
 
+#[cfg(test)]
+#[cfg(test)]
 fn parse_usage_from_sse(bytes: &Bytes) -> (Option<i32>, Option<i32>, Option<String>) {
     let payload = String::from_utf8_lossy(bytes);
     let mut input_tokens = None;
@@ -531,6 +545,15 @@ fn estimate_cost(
     crate::proxy::price_cache::global().estimate_cost(model_name, input, output)
 }
 
+pub fn recompute_estimated_cost_from_log(log: &ProxyRequestLog) -> Option<f64> {
+    estimate_cost(
+        log.account_id.as_deref(),
+        &log.model,
+        log.input_tokens,
+        log.output_tokens,
+    )
+}
+
 /// Truncate a body to `BODY_TRUNCATE_BYTES` and return a UTF-8 string.
 /// Non-UTF-8 bytes are replaced with the Unicode replacement character.
 fn truncate_body(bytes: &Bytes) -> String {
@@ -580,5 +603,56 @@ mod tests {
         assert_eq!(input, Some(64));
         assert_eq!(output, Some(16));
         assert_eq!(error, None);
+    }
+
+    #[tokio::test]
+    async fn sse_logging_survives_client_disconnect() {
+        let monitor = Arc::new(ProxyMonitor::new(10));
+        let upstream = async_stream::stream! {
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"usage\":{\"prompt_tokens\":12}}\n\n",
+            ));
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"usage\":{\"completion_tokens\":5}}\n\ndata: [DONE]\n",
+            ));
+        };
+
+        let response = Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(Body::from_stream(upstream))
+            .unwrap();
+
+        let wrapped = wrap_sse_response(
+            monitor.clone(),
+            response,
+            StreamLogContext {
+                id: "test-log".to_string(),
+                timestamp: chrono::Utc::now().timestamp(),
+                method: "POST".to_string(),
+                url: "/v1/chat/completions".to_string(),
+                status: 200,
+                started_at: Instant::now(),
+                model: Some("gpt-5.2".to_string()),
+                account_id: None,
+                upstream_url: None,
+                client_ip: None,
+                request_body: None,
+                original_request_body: None,
+                api_key: None,
+            },
+        );
+
+        let (_parts, body) = wrapped.into_parts();
+        let mut stream = body.into_data_stream();
+        let _ = stream.next().await;
+        drop(stream);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(monitor.get_count(), 1);
+        let log = monitor.get_log("test-log").unwrap();
+        assert_eq!(log.input_tokens, Some(12));
+        assert_eq!(log.output_tokens, Some(5));
     }
 }

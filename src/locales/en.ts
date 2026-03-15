@@ -4,6 +4,7 @@ const en = {
   "nav.accounts": "Accounts",
   "nav.hub": "Hub",
   "nav.proxy": "Proxy",
+  "nav.tokens": "Tokens",
   "nav.monitor": "Monitor",
   "nav.settings": "Settings",
 

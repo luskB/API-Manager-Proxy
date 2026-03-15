@@ -6,6 +6,7 @@ const zh: Translations = {
   "nav.accounts": "账户",
   "nav.hub": "Hub",
   "nav.proxy": "代理",
+  "nav.tokens": "Token统计",
   "nav.monitor": "监控",
   "nav.settings": "设置",
 
