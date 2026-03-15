@@ -293,10 +293,10 @@ const en = {
   "settings.closeBehaviorQuit": "Quit the app",
   "settings.closeBehaviorTray": "Hide to system tray",
   "settings.closeBehaviorHint":
-    "Choose whether clicking the close button exits APIManager or keeps it running in the tray.",
+    "Choose whether clicking the close button exits APIManagerProxy or keeps it running in the tray.",
   "settings.launchOnStartup": "Launch on system startup",
   "settings.launchOnStartupHint":
-    "Create a Windows startup entry so APIManager opens automatically after sign-in.",
+    "Create a Windows startup entry so APIManagerProxy opens automatically after sign-in.",
   "settings.network": "Network",
   "settings.allowLan": "Allow LAN Access (bind to 0.0.0.0)",
   "settings.requestTimeout": "Request Timeout (seconds)",

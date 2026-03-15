@@ -31,7 +31,7 @@ export default function Layout() {
     <div className="min-h-screen bg-base-200">
       <div className="navbar bg-base-100/80 backdrop-blur-md border-b border-base-300 px-6 sticky top-0 z-30">
         <div className="flex-1">
-          <span className="text-lg font-bold">APIManager</span>
+          <span className="text-lg font-bold">APIManagerProxy</span>
         </div>
         <div className="flex-none flex items-center gap-2">
           <ul className="menu menu-horizontal gap-1">

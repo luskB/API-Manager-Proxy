@@ -18,6 +18,8 @@ use tauri::{
     Manager, WindowEvent,
 };
 
+use crate::constants::APP_NAME;
+
 #[derive(Default)]
 struct AppLifecycleState {
     allow_exit: Arc<AtomicBool>,
@@ -155,8 +157,8 @@ pub fn run() {
 }
 
 fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
-    let show = MenuItemBuilder::with_id("show", "Show APIManager").build(app)?;
-    let quit = MenuItemBuilder::with_id("quit", "Quit APIManager").build(app)?;
+    let show = MenuItemBuilder::with_id("show", format!("Show {APP_NAME}")).build(app)?;
+    let quit = MenuItemBuilder::with_id("quit", format!("Quit {APP_NAME}")).build(app)?;
     let menu = MenuBuilder::new(app).items(&[&show, &quit]).build()?;
 
     let mut builder = TrayIconBuilder::with_id("main-tray").menu(&menu);
@@ -216,7 +218,7 @@ fn should_hide_to_tray() -> bool {
 }
 
 fn run_headless() {
-    tracing::info!("Starting APIManager in headless mode...");
+    tracing::info!("Starting {} in headless mode...", APP_NAME);
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     rt.block_on(async {

@@ -1,17 +1,27 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const STARTUP_SCRIPT_NAME: &str = "APIManager.cmd";
+use crate::constants::APP_NAME;
+
+const STARTUP_SCRIPT_NAME: &str = "APIManagerProxy.cmd";
+const LEGACY_STARTUP_SCRIPT_NAME: &str = "APIManager.cmd";
 
 pub fn sync_launch_on_startup(enabled: bool) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         let script_path = startup_script_path()?;
+        let legacy_script_path = legacy_startup_script_path()?;
         if enabled {
             write_startup_script(&script_path)?;
+            if legacy_script_path.exists() {
+                let _ = fs::remove_file(&legacy_script_path);
+            }
         } else if script_path.exists() {
             fs::remove_file(&script_path)
                 .map_err(|e| format!("Failed to remove startup script: {}", e))?;
+            if legacy_script_path.exists() {
+                let _ = fs::remove_file(&legacy_script_path);
+            }
         }
     }
 
@@ -40,10 +50,24 @@ fn startup_script_path() -> Result<PathBuf, String> {
 }
 
 #[cfg(target_os = "windows")]
+fn legacy_startup_script_path() -> Result<PathBuf, String> {
+    let base = dirs::config_dir()
+        .or_else(dirs::data_dir)
+        .ok_or_else(|| "Cannot determine startup directory".to_string())?;
+    let startup_dir = base
+        .join("Microsoft")
+        .join("Windows")
+        .join("Start Menu")
+        .join("Programs")
+        .join("Startup");
+    Ok(startup_dir.join(LEGACY_STARTUP_SCRIPT_NAME))
+}
+
+#[cfg(target_os = "windows")]
 fn write_startup_script(path: &Path) -> Result<(), String> {
     let current_exe =
         std::env::current_exe().map_err(|e| format!("Failed to locate current executable: {}", e))?;
     let escaped = current_exe.to_string_lossy().replace('"', "\"\"");
-    let script = format!("@echo off\r\nstart \"\" \"{}\"\r\n", escaped);
+    let script = format!("@echo off\r\nrem Launch {}\r\nstart \"\" \"{}\"\r\n", APP_NAME, escaped);
     fs::write(path, script).map_err(|e| format!("Failed to write startup script: {}", e))
 }

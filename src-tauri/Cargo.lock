@@ -60,8 +60,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
-name = "apimanager"
-version = "0.1.0"
+name = "apimanagerproxy"
+version = "1.4.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -98,6 +98,7 @@ dependencies = [
  "tracing-log",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

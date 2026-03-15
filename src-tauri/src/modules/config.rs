@@ -1,7 +1,9 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::constants::{CONFIG_FILE_NAME, DATA_DIR_NAME};
+use crate::constants::{
+    CONFIG_FILE_NAME, DATA_DIR_NAME, LEGACY_CONFIG_FILE_NAME, LEGACY_DATA_DIR_NAME,
+};
 use crate::models::{AppConfig, SiteAccount};
 
 pub fn derive_proxy_accounts(accounts: &[SiteAccount]) -> Vec<SiteAccount> {
@@ -18,6 +20,67 @@ pub fn normalized_app_config(config: &AppConfig) -> AppConfig {
     normalized
 }
 
+fn legacy_data_dir(base: &Path) -> PathBuf {
+    base.join(LEGACY_DATA_DIR_NAME)
+}
+
+fn copy_dir_recursive(source: &Path, target: &Path) -> Result<(), String> {
+    if !source.exists() {
+        return Ok(());
+    }
+
+    if !target.exists() {
+        fs::create_dir_all(target)
+            .map_err(|e| format!("Failed to create migration directory: {}", e))?;
+    }
+
+    for entry in fs::read_dir(source)
+        .map_err(|e| format!("Failed to read legacy data directory: {}", e))?
+    {
+        let entry = entry.map_err(|e| format!("Failed to inspect legacy entry: {}", e))?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("Failed to read legacy entry type: {}", e))?;
+
+        if file_type.is_dir() {
+            copy_dir_recursive(&source_path, &target_path)?;
+        } else if !target_path.exists() {
+            fs::copy(&source_path, &target_path).map_err(|e| {
+                format!(
+                    "Failed to migrate legacy file {:?} -> {:?}: {}",
+                    source_path, target_path, e
+                )
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+fn migrate_legacy_data_dir(base: &Path, data_dir: &Path) -> Result<(), String> {
+    let legacy_dir = legacy_data_dir(base);
+    if !legacy_dir.exists() || legacy_dir == data_dir {
+        return Ok(());
+    }
+
+    copy_dir_recursive(&legacy_dir, data_dir)?;
+
+    let legacy_config_path = data_dir.join(LEGACY_CONFIG_FILE_NAME);
+    let config_path = data_dir.join(CONFIG_FILE_NAME);
+    if !config_path.exists() && legacy_config_path.exists() {
+        fs::copy(&legacy_config_path, &config_path).map_err(|e| {
+            format!(
+                "Failed to migrate legacy config {:?} -> {:?}: {}",
+                legacy_config_path, config_path, e
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
 /// Get the application data directory, creating it if necessary.
 pub fn get_data_dir() -> Result<PathBuf, String> {
     let base = dirs::config_dir()
@@ -25,6 +88,7 @@ pub fn get_data_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "Cannot determine config directory".to_string())?;
 
     let data_dir = base.join(DATA_DIR_NAME);
+    migrate_legacy_data_dir(&base, &data_dir)?;
     if !data_dir.exists() {
         fs::create_dir_all(&data_dir)
             .map_err(|e| format!("Failed to create data directory: {}", e))?;
@@ -111,7 +175,7 @@ mod tests {
 
     #[test]
     fn save_and_load_config_round_trip() {
-        let tmp = env::temp_dir().join("apimanager_test_config");
+        let tmp = env::temp_dir().join("apimanagerproxy_test_config");
         let _ = fs::create_dir_all(&tmp);
 
         let config_path = tmp.join(CONFIG_FILE_NAME);

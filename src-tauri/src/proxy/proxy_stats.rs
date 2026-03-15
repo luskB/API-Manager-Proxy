@@ -89,17 +89,17 @@ impl StatsScope {
 
     fn retention_start(self, now: i64) -> i64 {
         match self {
-            Self::Hourly => now - 24 * 60 * 60,
-            Self::Daily => now - 7 * 24 * 60 * 60,
-            Self::Weekly => now - 8 * 7 * 24 * 60 * 60,
+            Self::Hourly => now - 60 * 60,
+            Self::Daily => now - 24 * 60 * 60,
+            Self::Weekly => now - 7 * 24 * 60 * 60,
         }
     }
 
     fn bucket_size_secs(self) -> i64 {
         match self {
-            Self::Hourly => 60 * 60,
-            Self::Daily => 24 * 60 * 60,
-            Self::Weekly => 7 * 24 * 60 * 60,
+            Self::Hourly => 5 * 60,
+            Self::Daily => 60 * 60,
+            Self::Weekly => 24 * 60 * 60,
         }
     }
 }
@@ -142,6 +142,30 @@ pub struct TokenTimelineBucket {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TokenModelSummary {
+    pub model: String,
+    pub total_cost: f64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_requests: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TokenModelDistributionSegment {
+    pub model: String,
+    pub cost: f64,
+    pub total_tokens: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TokenModelDistributionBucket {
+    pub timestamp: i64,
+    pub total_cost: f64,
+    pub total_tokens: i64,
+    pub segments: Vec<TokenModelDistributionSegment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TokenStatsView {
     pub scope: String,
     pub window_start: i64,
@@ -150,6 +174,8 @@ pub struct TokenStatsView {
     pub per_account: HashMap<String, AccountStats>,
     pub per_model: HashMap<String, AccountStats>,
     pub timeline: Vec<TokenTimelineBucket>,
+    pub top_models: Vec<TokenModelSummary>,
+    pub distribution: Vec<TokenModelDistributionBucket>,
 }
 
 /// Per-key cost statistics for multi-user API key tracking.
@@ -486,12 +512,19 @@ impl StatsAccumulator {
             }
         };
 
+        let window_events: Vec<StatsEvent> = data
+            .recent_events
+            .iter()
+            .filter(|event| event.timestamp >= window_start)
+            .cloned()
+            .collect();
+
         let mut summary = AccountStats::default();
         let mut per_account = HashMap::new();
         let mut per_model = HashMap::new();
         let mut timeline_map: HashMap<i64, TokenTimelineBucket> = HashMap::new();
 
-        for event in data.recent_events.iter().filter(|event| event.timestamp >= window_start) {
+        for event in &window_events {
             accumulate_account_stats(&mut summary, event);
 
             if let Some(account_id) = event.account_id.as_ref().filter(|value| !value.is_empty()) {
@@ -519,6 +552,109 @@ impl StatsAccumulator {
         let mut timeline: Vec<TokenTimelineBucket> = timeline_map.into_values().collect();
         timeline.sort_by_key(|bucket| bucket.timestamp);
 
+        let mut top_models: Vec<TokenModelSummary> = per_model
+            .iter()
+            .map(|(model, stats)| TokenModelSummary {
+                model: model.clone(),
+                total_cost: stats.total_estimated_cost,
+                total_input_tokens: stats.total_input_tokens,
+                total_output_tokens: stats.total_output_tokens,
+                total_requests: stats.total_requests,
+            })
+            .collect();
+        top_models.sort_by(|left, right| {
+            right
+                .total_cost
+                .partial_cmp(&left.total_cost)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    (right.total_input_tokens + right.total_output_tokens)
+                        .cmp(&(left.total_input_tokens + left.total_output_tokens))
+                })
+                .then_with(|| right.total_requests.cmp(&left.total_requests))
+        });
+        top_models.truncate(4);
+
+        let tracked_models: Vec<String> = top_models.iter().map(|row| row.model.clone()).collect();
+        let has_other_models = per_model.len() > tracked_models.len();
+        let mut distribution_map: HashMap<i64, TokenModelDistributionBucket> = HashMap::new();
+
+        for event in &window_events {
+            let bucket_ts = (event.timestamp / bucket_size) * bucket_size;
+            let bucket = distribution_map
+                .entry(bucket_ts)
+                .or_insert_with(|| TokenModelDistributionBucket {
+                    timestamp: bucket_ts,
+                    ..Default::default()
+                });
+
+            let cost = event_effective_cost(event);
+            let tokens = (event.input_tokens + event.output_tokens).max(0);
+            bucket.total_cost += cost;
+            bucket.total_tokens += tokens;
+
+            let segment_model = event
+                .model
+                .as_ref()
+                .filter(|model| tracked_models.iter().any(|tracked| tracked == *model))
+                .cloned()
+                .unwrap_or_else(|| {
+                    if has_other_models {
+                        "Other".to_string()
+                    } else {
+                        event.model.clone().unwrap_or_else(|| "Unknown".to_string())
+                    }
+                });
+
+            if let Some(existing) = bucket
+                .segments
+                .iter_mut()
+                .find(|segment| segment.model == segment_model)
+            {
+                existing.cost += cost;
+                existing.total_tokens += tokens;
+            } else {
+                bucket.segments.push(TokenModelDistributionSegment {
+                    model: segment_model,
+                    cost,
+                    total_tokens: tokens,
+                });
+            }
+        }
+
+        let mut distribution: Vec<TokenModelDistributionBucket> = distribution_map.into_values().collect();
+        distribution.sort_by_key(|bucket| bucket.timestamp);
+        for bucket in &mut distribution {
+            bucket.segments.sort_by(|left, right| {
+                let left_rank = tracked_models
+                    .iter()
+                    .position(|model| model == &left.model)
+                    .unwrap_or(tracked_models.len());
+                let right_rank = tracked_models
+                    .iter()
+                    .position(|model| model == &right.model)
+                    .unwrap_or(tracked_models.len());
+                left_rank.cmp(&right_rank)
+            });
+        }
+
+        if has_other_models {
+            let other_summary = per_model.iter().fold(TokenModelSummary::default(), |mut acc, (model, stats)| {
+                if tracked_models.iter().any(|tracked| tracked == model) {
+                    return acc;
+                }
+                acc.model = "Other".to_string();
+                acc.total_cost += stats.total_estimated_cost;
+                acc.total_input_tokens += stats.total_input_tokens;
+                acc.total_output_tokens += stats.total_output_tokens;
+                acc.total_requests += stats.total_requests;
+                acc
+            });
+            if other_summary.total_requests > 0 {
+                top_models.push(other_summary);
+            }
+        }
+
         TokenStatsView {
             scope: match scope {
                 StatsScope::Hourly => "hourly".to_string(),
@@ -531,6 +667,8 @@ impl StatsAccumulator {
             per_account,
             per_model,
             timeline,
+            top_models,
+            distribution,
         }
     }
 

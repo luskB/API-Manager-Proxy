@@ -59,6 +59,14 @@ interface ProxyKeyEditor {
 
 type ModelPriceSort = "default" | "asc" | "desc";
 
+interface HoverPreviewState {
+  title?: string;
+  content: string;
+  left: number;
+  top: number;
+  placement: "top" | "bottom";
+}
+
 function newKeyValue(): string {
   return `sk-${crypto.randomUUID().replace(/-/g, "").slice(0, 32)}`;
 }
@@ -151,6 +159,7 @@ export default function ProxyPage() {
   const [modelSearchInput, setModelSearchInput] = useState("");
   const [modelSearch, setModelSearch] = useState("");
   const [priceSort, setPriceSort] = useState<ModelPriceSort>("default");
+  const [hoverPreview, setHoverPreview] = useState<HoverPreviewState | null>(null);
   const { t, locale } = useLocale();
 
   const text = (zh: string, en: string) => (locale === "zh" ? zh : en);
@@ -180,6 +189,19 @@ export default function ProxyPage() {
     const timer = setTimeout(() => setSaveStatus(""), 3000);
     return () => clearTimeout(timer);
   }, [saveStatus]);
+
+  useEffect(() => {
+    if (!hoverPreview) return;
+
+    const dismiss = () => setHoverPreview(null);
+    window.addEventListener("scroll", dismiss, true);
+    window.addEventListener("resize", dismiss);
+
+    return () => {
+      window.removeEventListener("scroll", dismiss, true);
+      window.removeEventListener("resize", dismiss);
+    };
+  }, [hoverPreview]);
 
   useEffect(() => {
     if (!config) return;
@@ -347,6 +369,7 @@ export default function ProxyPage() {
     setModelSearchInput("");
     setModelSearch("");
     setPriceSort("default");
+    setHoverPreview(null);
     setEditorOpen(true);
   }
 
@@ -367,6 +390,7 @@ export default function ProxyPage() {
     setModelSearchInput("");
     setModelSearch("");
     setPriceSort("default");
+    setHoverPreview(null);
     setEditorOpen(true);
   }
 
@@ -378,6 +402,7 @@ export default function ProxyPage() {
     setModelSearchInput("");
     setModelSearch("");
     setPriceSort("default");
+    setHoverPreview(null);
   }
 
   function toggleSite(accountId: string) {
@@ -414,6 +439,31 @@ export default function ProxyPage() {
   function clearModelSearch() {
     setModelSearchInput("");
     setModelSearch("");
+  }
+
+  function showHoverPreview(target: HTMLElement, content: string, title?: string) {
+    const rect = target.getBoundingClientRect();
+    const maxWidth = Math.min(360, window.innerWidth - 32);
+    const halfWidth = maxWidth / 2;
+    const placement: "top" | "bottom" = rect.top < 120 ? "bottom" : "top";
+    const center = rect.left + rect.width / 2;
+    const left = Math.min(
+      Math.max(center, 16 + halfWidth),
+      window.innerWidth - 16 - halfWidth,
+    );
+    const top = placement === "top" ? rect.top - 14 : rect.bottom + 14;
+
+    setHoverPreview({
+      title,
+      content,
+      left,
+      top,
+      placement,
+    });
+  }
+
+  function hideHoverPreview() {
+    setHoverPreview(null);
   }
 
   function legacyPriceTooltip(model: string): string {
@@ -1055,7 +1105,17 @@ curl http://127.0.0.1:${config.proxy.port}/health`}
                             checked={editor.allowed_models.includes(model)}
                             onChange={() => toggleModel(model)}
                           />
-                          <span className="truncate" title={model}>
+                          <span
+                            className="truncate"
+                            onMouseEnter={(event) =>
+                              showHoverPreview(
+                                event.currentTarget,
+                                model,
+                                text("完整模型名", "Full model name"),
+                              )
+                            }
+                            onMouseLeave={hideHoverPreview}
+                          >
                             {model}
                           </span>
                         </span>
@@ -1066,7 +1126,22 @@ curl http://127.0.0.1:${config.proxy.port}/health`}
                             e.preventDefault();
                             e.stopPropagation();
                           }}
-                          title={priceTooltip(model)}
+                          onMouseEnter={(event) =>
+                            showHoverPreview(
+                              event.currentTarget,
+                              priceTooltip(model),
+                              text("价格预览", "Price preview"),
+                            )
+                          }
+                          onMouseLeave={hideHoverPreview}
+                          onFocus={(event) =>
+                            showHoverPreview(
+                              event.currentTarget,
+                              priceTooltip(model),
+                              text("价格预览", "Price preview"),
+                            )
+                          }
+                          onBlur={hideHoverPreview}
                           aria-label={priceTooltip(model)}
                         >
                           <DollarSign
@@ -1091,6 +1166,35 @@ curl http://127.0.0.1:${config.proxy.port}/health`}
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {editorOpen && hoverPreview && (
+        <div
+          className="pointer-events-none fixed z-[80]"
+          style={{
+            left: hoverPreview.left,
+            top: hoverPreview.top,
+            transform:
+              hoverPreview.placement === "top"
+                ? "translate(-50%, -100%)"
+                : "translate(-50%, 0)",
+          }}
+        >
+          {hoverPreview.placement === "bottom" && (
+            <div className="mx-auto -mb-1 h-3 w-3 rotate-45 border border-slate-700/90 bg-slate-900/95" />
+          )}
+          <div className="max-w-[22rem] rounded-2xl border border-slate-700/90 bg-slate-900/95 px-3 py-2 text-left text-xs leading-5 text-slate-100 shadow-2xl backdrop-blur-sm">
+            {hoverPreview.title && (
+              <div className="mb-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-emerald-300">
+                {hoverPreview.title}
+              </div>
+            )}
+            <div className="whitespace-pre-line break-words">{hoverPreview.content}</div>
+          </div>
+          {hoverPreview.placement === "top" && (
+            <div className="mx-auto -mt-1 h-3 w-3 rotate-45 border border-slate-700/90 bg-slate-900/95" />
+          )}
         </div>
       )}
     </div>

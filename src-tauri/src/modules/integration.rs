@@ -1,6 +1,6 @@
 /// System integration abstraction for Desktop vs Headless mode.
 ///
-/// In APIManager (unlike AG), we don't need process control or DB injection.
+/// In APIManagerProxy (unlike AG), we don't need process control or DB injection.
 /// This is a simplified version that only handles notifications and mode detection.
 #[derive(Clone)]
 pub enum SystemManager {

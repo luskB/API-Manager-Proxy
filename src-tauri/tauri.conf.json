@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "APIManager",
-  "version": "1.3.0",
-  "identifier": "com.allapihub.apimanager",
+  "productName": "APIManagerProxy",
+  "version": "1.4.0",
+  "identifier": "com.luskb.apimanagerproxy",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://127.0.0.1:1420",
@@ -13,7 +13,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "APIManager",
+        "title": "APIManagerProxy",
         "width": 1120,
         "height": 740,
         "minWidth": 900,

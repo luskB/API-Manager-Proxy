@@ -189,7 +189,7 @@ pub fn discover_extension_dirs() -> Vec<ExtensionInfo> {
 pub fn read_extension_storage(ext_dir: &Path) -> Result<String, String> {
     // 1. Create temp directory
     let temp_dir = std::env::temp_dir().join(format!(
-        "apimanager-leveldb-{}",
+            "apimanagerproxy-leveldb-{}",
         uuid::Uuid::new_v4().simple()
     ));
 
@@ -352,7 +352,7 @@ mod tests {
     fn test_discover_with_mock_structure() {
         // Create a temporary directory structure mimicking Chrome
         let temp = std::env::temp_dir().join(format!(
-            "apimanager-test-chrome-{}",
+            "apimanagerproxy-test-chrome-{}",
             uuid::Uuid::new_v4().simple()
         ));
         let profile_dir = temp.join("Default").join("Local Extension Settings");
@@ -370,7 +370,7 @@ mod tests {
     fn test_read_leveldb_basic() {
         // Create a real LevelDB database with site_accounts data
         let temp = std::env::temp_dir().join(format!(
-            "apimanager-test-leveldb-{}",
+            "apimanagerproxy-test-leveldb-{}",
             uuid::Uuid::new_v4().simple()
         ));
 

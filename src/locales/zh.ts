@@ -296,7 +296,7 @@ const zh: Translations = {
   "settings.closeBehaviorTray": "缩小到系统托盘",
   "settings.closeBehaviorHint": "控制点击窗口右上角关闭按钮后，是退出程序还是隐藏到托盘继续运行。",
   "settings.launchOnStartup": "开机自动启动",
-  "settings.launchOnStartupHint": "在 Windows 启动项中创建入口，登录系统后自动打开 APIManager。",
+  "settings.launchOnStartupHint": "在 Windows 启动项中创建入口，登录系统后自动打开 APIManagerProxy。",
   "settings.network": "网络",
   "settings.allowLan": "允许局域网访问（绑定到 0.0.0.0）",
   "settings.requestTimeout": "请求超时（秒）",

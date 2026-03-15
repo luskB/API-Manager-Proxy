@@ -190,13 +190,13 @@ async fn start_fake_upstream() -> (SocketAddr, FakeUpstreamState) {
 // Helpers to create proxy config + fake account
 // ---------------------------------------------------------------------------
 
-fn make_test_account(id: &str, site_url: &str) -> apimanager_lib::models::SiteAccount {
-    apimanager_lib::models::SiteAccount {
+fn make_test_account(id: &str, site_url: &str) -> apimanagerproxy_lib::models::SiteAccount {
+    apimanagerproxy_lib::models::SiteAccount {
         id: id.to_string(),
         site_name: format!("test-{}", id),
         site_url: site_url.to_string(),
         site_type: "new-api".to_string(),
-        account_info: apimanager_lib::models::AccountInfo {
+        account_info: apimanagerproxy_lib::models::AccountInfo {
             id: 1,
             access_token: "test-access-token".to_string(),
             api_key: Some("sk-test-key-12345".to_string()),
@@ -222,19 +222,19 @@ fn make_test_account(id: &str, site_url: &str) -> apimanager_lib::models::SiteAc
     }
 }
 
-fn make_test_proxy_config(port: u16) -> apimanager_lib::models::ProxyConfig {
-    apimanager_lib::models::ProxyConfig {
+fn make_test_proxy_config(port: u16) -> apimanagerproxy_lib::models::ProxyConfig {
+    apimanagerproxy_lib::models::ProxyConfig {
         enabled: true,
         port,
         api_key: String::new(), // no auth for tests
         admin_password: None,
-        auth_mode: apimanager_lib::models::ProxyAuthMode::Off,
+        auth_mode: apimanagerproxy_lib::models::ProxyAuthMode::Off,
         allow_lan_access: false,
         auto_start: false,
         request_timeout: 30,
         enable_logging: true,
-        upstream_proxy: apimanager_lib::models::UpstreamProxyConfig::default(),
-        load_balance_mode: apimanager_lib::models::LoadBalanceMode::default(),
+        upstream_proxy: apimanagerproxy_lib::models::UpstreamProxyConfig::default(),
+        load_balance_mode: apimanagerproxy_lib::models::LoadBalanceMode::default(),
         daily_cost_limit: 0.0,
         monthly_cost_limit: 0.0,
         budget_exceeded_action: "warn".to_string(),
@@ -264,7 +264,7 @@ async fn anthropic_non_stream_round_trip() {
     let config = make_test_proxy_config(proxy_port);
     let accounts = vec![make_test_account("acc-1", &upstream_url)];
 
-    let mut server = apimanager_lib::proxy::server::start_server(&config, &accounts)
+    let mut server = apimanagerproxy_lib::proxy::server::start_server(&config, &accounts)
         .await
         .expect("proxy should start");
 
@@ -348,7 +348,7 @@ async fn anthropic_system_prompt_conversion() {
     let config = make_test_proxy_config(proxy_port);
     let accounts = vec![make_test_account("acc-sys", &upstream_url)];
 
-    let mut server = apimanager_lib::proxy::server::start_server(&config, &accounts)
+    let mut server = apimanagerproxy_lib::proxy::server::start_server(&config, &accounts)
         .await
         .expect("proxy should start");
 
@@ -395,7 +395,7 @@ async fn anthropic_stream_round_trip() {
     let config = make_test_proxy_config(proxy_port);
     let accounts = vec![make_test_account("acc-stream", &upstream_url)];
 
-    let mut server = apimanager_lib::proxy::server::start_server(&config, &accounts)
+    let mut server = apimanagerproxy_lib::proxy::server::start_server(&config, &accounts)
         .await
         .expect("proxy should start");
 
@@ -467,7 +467,7 @@ async fn api_key_empty_returns_503() {
     let mut account = make_test_account("acc-nokey", &upstream_url);
     account.account_info.api_key = None;
 
-    let mut server = apimanager_lib::proxy::server::start_server(&config, &[account])
+    let mut server = apimanagerproxy_lib::proxy::server::start_server(&config, &[account])
         .await
         .expect("proxy should start");
 
@@ -508,7 +508,7 @@ async fn anthropic_retries_on_500() {
         make_test_account("acc-b", &upstream_url),
     ];
 
-    let mut server = apimanager_lib::proxy::server::start_server(&config, &accounts)
+    let mut server = apimanagerproxy_lib::proxy::server::start_server(&config, &accounts)
         .await
         .expect("proxy should start");
 
@@ -608,7 +608,7 @@ async fn upstream_receives_content_type_json() {
     let config = make_test_proxy_config(proxy_port);
     let accounts = vec![make_test_account("acc-ct", &upstream_url)];
 
-    let mut server = apimanager_lib::proxy::server::start_server(&config, &accounts)
+    let mut server = apimanagerproxy_lib::proxy::server::start_server(&config, &accounts)
         .await
         .expect("proxy should start");
 

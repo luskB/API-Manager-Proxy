@@ -180,11 +180,11 @@ export default function Dashboard() {
   function scopeSummary(): string {
     switch (statsScope) {
       case "hourly":
-        return text("Last 24 hours", "Last 24 hours");
+        return text("Last 60 minutes", "Last 60 minutes");
       case "daily":
-        return text("Last 7 days", "Last 7 days");
+        return text("Last 24 hours", "Last 24 hours");
       case "weekly":
-        return text("Last 8 weeks", "Last 8 weeks");
+        return text("Last 7 days", "Last 7 days");
       default:
         return "";
     }
@@ -193,14 +193,12 @@ export default function Dashboard() {
   function formatBucketLabel(timestamp: number): string {
     const date = new Date(timestamp * 1000);
     if (statsScope === "hourly") {
-      return String(date.getHours()).padStart(2, "0");
+      return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
     }
     if (statsScope === "daily") {
-      return `${date.getMonth() + 1}/${date.getDate()}`;
+      return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
     }
-    const firstDay = new Date(date);
-    firstDay.setDate(date.getDate() - date.getDay());
-    return `${firstDay.getMonth() + 1}/${firstDay.getDate()}`;
+    return `${date.getMonth() + 1}/${date.getDate()}`;
   }
 
   return (

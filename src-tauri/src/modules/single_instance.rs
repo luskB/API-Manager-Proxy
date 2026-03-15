@@ -3,6 +3,8 @@ use std::ffi::OsStr;
 #[cfg(target_os = "windows")]
 use std::os::windows::ffi::OsStrExt;
 
+use crate::constants::{APP_IDENTIFIER, APP_NAME};
+
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::{
     Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE},
@@ -47,7 +49,7 @@ impl Drop for SingleInstanceGuard {
 pub fn acquire_single_instance_guard() -> Result<Option<SingleInstanceGuard>, String> {
     #[cfg(target_os = "windows")]
     {
-        let mutex_name = to_wide("APIManager.SingleInstance.com.allapihub.apimanager");
+        let mutex_name = to_wide(&format!("{APP_NAME}.SingleInstance.{APP_IDENTIFIER}"));
         let handle = unsafe { CreateMutexW(std::ptr::null(), 1, mutex_name.as_ptr()) };
         if handle.is_null() {
             return Err(format!(
@@ -76,8 +78,8 @@ pub fn acquire_single_instance_guard() -> Result<Option<SingleInstanceGuard>, St
 
 #[cfg(target_os = "windows")]
 fn show_already_running_message() {
-    let title = to_wide("APIManager");
-    let message = to_wide("APIManager 已经在运行中，请勿重复打开。");
+    let title = to_wide(APP_NAME);
+    let message = to_wide(&format!("{APP_NAME} 已经在运行中，请勿重复打开。"));
     unsafe {
         MessageBoxW(
             std::ptr::null_mut(),
