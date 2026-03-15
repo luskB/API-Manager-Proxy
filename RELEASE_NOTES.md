@@ -1,31 +1,33 @@
-## APIManagerProxy v1.5.0
+## APIManagerProxy v1.6.0
 
-本次发布主要聚焦在桌面使用体验、Hub 批量操作和统计展示优化。
+This release focuses on stability and day-to-day usability for local proxy workflows and CLI sync.
 
-### 新增与优化
+### Highlights
 
-- 监控页自动刷新状态现在会在本次应用运行期间保持，不会因为切换到仪表盘、Hub 或其它页面而自动关闭
-- Hub 页面新增选中系统，支持：
-  - 全选当前结果
-  - 清除选中
-  - 只刷新选中的站点余额与今日消耗
-  - 只对选中的站点执行签到
-- Token 统计页的时间窗口展示调整为“最新时间优先”，查看最近数据更直接
-- README 已更新为当前产品名 `APIManagerProxy`，并同步整理了功能说明、接入方式和截图章节
+- Improved proxy status detection on the Proxy page.
+  The app now corrects stale "stopped" states after startup and handles local port conflicts more gracefully when the proxy is already active.
 
-### 已包含的近期稳定性修复
+- Better model diagnostics in the Proxy page.
+  When configuring per-key model access, hovering a model now shows its source site information, making it easier to confirm where each model comes from.
 
-- 修复仪表盘顶部代理状态在启动初期误显示“已停止”的问题
-- 修复 OpenCode CLI 同步路径与配置格式，适配当前 `~/.config/opencode/opencode.json`
-- 完善 CLI 模型同步交互，支持同步全部、全部移除和二次确认
-- 保持本地代理、Token 统计、Hub 刷新与批量操作之间的数据一致性
+- CLI sync now keeps site-aware model selections more reliably.
+  Site-prefixed model labels remain visible in the sync list, while synced CLI configs still receive bare model IDs for compatibility.
 
-### 下载
+- CLI sync selection UX has been cleaned up.
+  The selected model list is easier to review, bulk actions are clearer, and the sync panel is more consistent with the rest of the app theme.
 
-| 平台 | 架构 | 文件 |
+### Included fixes
+
+- Refined route-backed CLI model syncing so site-specific selections remain usable with local proxy routing.
+- Improved startup-time proxy state refresh behavior to reduce false stop/start confusion.
+- Polished the Proxy page model picker tooltips and preserved the current working proxy behavior.
+
+### Downloads
+
+| Platform | Architecture | File |
 | --- | --- | --- |
 | Windows | x64 | `apimanagerproxy.exe` |
-| Windows | x64 | `APIManagerProxy_1.5.0_x64-setup.exe` |
-| Windows | x64 | `APIManagerProxy_1.5.0_x64_en-US.msi` |
-| macOS | Apple Silicon / Intel | GitHub Actions 自动构建产物 |
-| Linux | x64 | GitHub Actions 自动构建产物 |
+| Windows | x64 | `APIManagerProxy_1.6.0_x64-setup.exe` |
+| Windows | x64 | `APIManagerProxy_1.6.0_x64_en-US.msi` |
+| macOS | Apple Silicon / Intel | Built by GitHub Actions |
+| Linux | x64 | Built by GitHub Actions |

@@ -10,7 +10,7 @@ use std::collections::HashSet;
 
 use crate::proxy::handlers::common::{
     apply_retry_strategy, determine_retry_strategy, effective_max_retries, is_auth_error,
-    rate_limit_duration_for_status, should_rotate_account,
+    merge_account_filters, rate_limit_duration_for_status, should_rotate_account,
 };
 use crate::proxy::middleware::auth::AuthenticatedKey;
 use crate::proxy::middleware::monitor::{
@@ -242,7 +242,10 @@ async fn forward_with_retry_inner(
         };
         requested_raw_model = Some(alias_input.clone());
 
-        let resolved = state.model_router.resolve_alias(&alias_input);
+        let resolved = {
+            let router = state.model_router.read().await;
+            router.resolve_alias(&alias_input)
+        };
         if resolved != *m {
             if let Some(account_selector) = maybe_account {
                 tracing::info!(
@@ -275,6 +278,16 @@ async fn forward_with_retry_inner(
     let mut last_account_id: Option<String> = None;
     let body_template = body;
     let forced_route = forced_account_id.is_some();
+    let preferred_route_accounts = if forced_route {
+        forced_account_id.clone().map(|account_id| vec![account_id])
+    } else if let Some(requested_model) = model.as_deref() {
+        let router = state.model_router.read().await;
+        router.preferred_accounts(requested_model)
+    } else {
+        None
+    };
+    let (candidate_accounts, has_route_override) =
+        merge_account_filters(preferred_route_accounts.clone(), allowed_accounts.as_ref());
 
     if let Some(raw_model) = requested_raw_model.as_deref() {
         let effective_model = model.as_deref().unwrap_or(raw_model);
@@ -327,6 +340,26 @@ async fn forward_with_retry_inner(
         }
     }
 
+    if !forced_route
+        && has_route_override
+        && candidate_accounts
+            .as_ref()
+            .map(|account_ids| account_ids.is_empty())
+            .unwrap_or(false)
+    {
+        return (
+            (
+                StatusCode::FORBIDDEN,
+                error_json("This API key is not allowed to access the selected site"),
+            )
+                .into_response(),
+            last_site_url,
+            last_effective_model,
+            last_effective_request_body,
+            last_account_id,
+        );
+    }
+
     for attempt in 0..=max_retries {
         let candidate = match forced_account_id.as_deref() {
             Some(account_id) => state.token_manager.get_token_for_account(
@@ -340,7 +373,7 @@ async fn forward_with_retry_inner(
                 model.as_deref(),
                 Some("openai"),
                 &failed_accounts,
-                allowed_accounts.as_ref(),
+                candidate_accounts.as_ref(),
             ),
         };
 
@@ -356,6 +389,19 @@ async fn forward_with_retry_inner(
                             Some("openai"),
                             &failed_accounts,
                         )
+                    })
+                    .or_else(|| {
+                        preferred_route_accounts
+                            .as_ref()
+                            .and_then(|account_ids| account_ids.first())
+                            .and_then(|account_id| {
+                                state.token_manager.explain_account_unavailability(
+                                    account_id,
+                                    model.as_deref(),
+                                    Some("openai"),
+                                    &failed_accounts,
+                                )
+                            })
                     })
                     .or_else(|| {
                         forced_account_selector.as_deref().map(|selector| {

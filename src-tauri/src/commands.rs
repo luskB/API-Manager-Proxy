@@ -9,6 +9,7 @@ use crate::models::{AppConfig, SiteAccount};
 use crate::modules::{backup, browser_login, browser_storage, config, desktop, hub_service};
 use crate::proxy::key_fetcher::{has_usable_api_key, populate_api_keys_for_accounts, ApiKeyFetchScope};
 use crate::proxy::middleware::SecurityConfig;
+use crate::proxy::model_router::ModelRouter;
 use crate::proxy::monitor::ProxyMonitor;
 use crate::proxy::proxy_stats::StatsScope;
 use crate::proxy::server::ProxyServerHandle;
@@ -21,6 +22,7 @@ pub struct ProxyServiceState {
     pub monitor: Arc<tokio::sync::RwLock<Option<Arc<ProxyMonitor>>>>,
     pub token_manager: Arc<tokio::sync::RwLock<Option<Arc<TokenManager>>>>,
     pub security: Arc<tokio::sync::RwLock<Option<Arc<tokio::sync::RwLock<SecurityConfig>>>>>,
+    pub model_router: Arc<tokio::sync::RwLock<Option<Arc<tokio::sync::RwLock<ModelRouter>>>>>,
 }
 
 impl ProxyServiceState {
@@ -30,6 +32,7 @@ impl ProxyServiceState {
             monitor: Arc::new(tokio::sync::RwLock::new(None)),
             token_manager: Arc::new(tokio::sync::RwLock::new(None)),
             security: Arc::new(tokio::sync::RwLock::new(None)),
+            model_router: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 }
@@ -505,6 +508,7 @@ pub async fn proxy_start(
     let monitor_ref = axum_server.monitor.clone();
     let token_manager_ref = axum_server.token_manager.clone();
     let security_ref = axum_server.security.clone();
+    let model_router_ref = axum_server.model_router.clone();
 
     // Set handle
     {
@@ -526,6 +530,10 @@ pub async fn proxy_start(
     {
         let mut security = state.security.write().await;
         *security = Some(security_ref);
+    }
+    {
+        let mut model_router = state.model_router.write().await;
+        *model_router = Some(model_router_ref);
     }
 
     // Persist config
@@ -558,6 +566,10 @@ pub async fn proxy_stop(state: tauri::State<'_, ProxyServiceState>) -> Result<()
     {
         let mut security = state.security.write().await;
         *security = None;
+    }
+    {
+        let mut model_router = state.model_router.write().await;
+        *model_router = None;
     }
 
     Ok(())
@@ -1451,6 +1463,15 @@ async fn sync_running_proxy_config(
         guard.api_key = config_data.proxy.api_key.clone();
         guard.admin_password = config_data.proxy.admin_password.clone();
         guard.api_keys = config_data.proxy.api_keys.clone();
+    }
+
+    let maybe_model_router = { state.model_router.read().await.clone() };
+    if let Some(model_router) = maybe_model_router {
+        let mut guard = model_router.write().await;
+        *guard = ModelRouter::new(
+            config_data.proxy.model_aliases.clone(),
+            config_data.proxy.model_routes.clone(),
+        );
     }
 }
 

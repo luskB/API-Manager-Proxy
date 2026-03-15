@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::time::Duration;
 
 /// Retry strategy for failed upstream requests.
@@ -77,6 +78,26 @@ const MAX_RETRY_CAP: usize = 10;
 /// Ensures we can cycle through all healthy accounts at least once, capped at MAX_RETRY_CAP.
 pub fn effective_max_retries(active_count: usize) -> usize {
     active_count.max(BASE_MAX_RETRIES).min(MAX_RETRY_CAP)
+}
+
+pub fn merge_account_filters(
+    preferred_accounts: Option<Vec<String>>,
+    allowed_accounts: Option<&HashSet<String>>,
+) -> (Option<HashSet<String>>, bool) {
+    match preferred_accounts {
+        Some(preferred) => {
+            let preferred_set: HashSet<String> = preferred.into_iter().collect();
+            let merged = match allowed_accounts {
+                Some(allowed) => preferred_set
+                    .into_iter()
+                    .filter(|account_id| allowed.contains(account_id))
+                    .collect(),
+                None => preferred_set,
+            };
+            (Some(merged), true)
+        }
+        None => (allowed_accounts.cloned(), false),
+    }
 }
 
 #[cfg(test)]
@@ -176,5 +197,24 @@ mod tests {
         assert_eq!(effective_max_retries(11), 10);
         assert_eq!(effective_max_retries(50), 10);
         assert_eq!(effective_max_retries(100), 10);
+    }
+
+    #[test]
+    fn merge_account_filters_prefers_route_accounts() {
+        let allowed = HashSet::from(["a".to_string(), "c".to_string()]);
+        let (merged, has_route) = merge_account_filters(
+            Some(vec!["a".to_string(), "b".to_string()]),
+            Some(&allowed),
+        );
+        assert!(has_route);
+        assert_eq!(merged, Some(HashSet::from(["a".to_string()])));
+    }
+
+    #[test]
+    fn merge_account_filters_falls_back_to_allowed_accounts() {
+        let allowed = HashSet::from(["a".to_string(), "c".to_string()]);
+        let (merged, has_route) = merge_account_filters(None, Some(&allowed));
+        assert!(!has_route);
+        assert_eq!(merged, Some(allowed));
     }
 }

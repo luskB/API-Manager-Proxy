@@ -51,6 +51,7 @@ export interface ProxyConfig {
     model_pattern: string;
     account_ids: string[];
     priority: number;
+    managed_by?: string;
   }>;
   api_keys?: Array<{
     key: string;

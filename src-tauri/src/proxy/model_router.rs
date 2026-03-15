@@ -149,6 +149,7 @@ mod tests {
                 model_pattern: "gpt-*".to_string(),
                 account_ids: vec!["acc-A".to_string(), "acc-B".to_string()],
                 priority: 0,
+                managed_by: None,
             }],
         );
         assert_eq!(

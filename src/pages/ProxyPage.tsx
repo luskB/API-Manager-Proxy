@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { request } from "../utils/request";
 import type { AppConfig } from "../types/backup";
 import {
@@ -45,6 +45,7 @@ interface ProxyModelPriceQuote {
 }
 
 type ProxyUserKey = NonNullable<AppConfig["proxy"]["api_keys"]>[number];
+type ProxyModelRoute = NonNullable<AppConfig["proxy"]["model_routes"]>[number];
 
 interface ProxyKeyEditor {
   key: string;
@@ -86,6 +87,16 @@ function defaultEditor(): ProxyKeyEditor {
 
 function dedupe(values: string[]): string[] {
   return Array.from(new Set(values.filter(Boolean))).sort((a, b) => a.localeCompare(b));
+}
+
+function mergeCliManagedRoutes(
+  currentRoutes: AppConfig["proxy"]["model_routes"] | undefined,
+  nextCliRoutes: ProxyModelRoute[],
+): ProxyModelRoute[] {
+  const preserved = (currentRoutes ?? []).filter(
+    (route) => route.managed_by !== "cli_sync",
+  );
+  return [...preserved, ...nextCliRoutes];
 }
 
 function maskKey(value: string): string {
@@ -164,25 +175,96 @@ export default function ProxyPage() {
 
   const text = (zh: string, en: string) => (locale === "zh" ? zh : en);
 
-  useEffect(() => {
-    if (!config || statusLoaded) return;
-    let cancelled = false;
-    request<ProxyStatus>("get_proxy_status")
-      .then((nextStatus) => {
-        if (!cancelled) {
+  const probeLocalProxy = useCallback(async (port: number) => {
+    if (!port) return false;
+
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 1200);
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/api/proxy/status`, {
+        method: "GET",
+        headers: { Accept: "application/json" },
+        cache: "no-store",
+        signal: controller.signal,
+      });
+      if (!response.ok) return false;
+      const payload = await response.json().catch(() => null);
+      return Boolean(payload && typeof payload === "object" && payload.running === true);
+    } catch {
+      return false;
+    } finally {
+      window.clearTimeout(timer);
+    }
+  }, []);
+
+  const refreshStatus = useCallback(
+    async (allowExternalProbe = true): Promise<ProxyStatus> => {
+      if (!config) {
+        const nextStatus = { running: false };
+        setStatus(nextStatus);
+        setStatusLoaded(true);
+        return nextStatus;
+      }
+
+      try {
+        const nextStatus = await request<ProxyStatus>("get_proxy_status");
+        if (nextStatus.running || !allowExternalProbe) {
           setStatus(nextStatus);
           setStatusLoaded(true);
+          return nextStatus;
         }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setStatusLoaded(true);
-        }
-      });
+
+        const reachable = await probeLocalProxy(config.proxy.port);
+        const resolved = { running: reachable };
+        setStatus(resolved);
+        setStatusLoaded(true);
+        return resolved;
+      } catch {
+        const reachable = allowExternalProbe
+          ? await probeLocalProxy(config.proxy.port)
+          : false;
+        const resolved = { running: reachable };
+        setStatus(resolved);
+        setStatusLoaded(true);
+        return resolved;
+      }
+    },
+    [config, probeLocalProxy],
+  );
+
+  useEffect(() => {
+    if (!config) return;
+
+    let cancelled = false;
+    const timeouts: number[] = [];
+    const sync = () => {
+      if (cancelled) return;
+      void refreshStatus();
+    };
+
+    sync();
+    [400, 1200, 2800].forEach((delay) => {
+      const id = window.setTimeout(sync, delay);
+      timeouts.push(id);
+    });
+
+    const intervalId = window.setInterval(sync, 5000);
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        sync();
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
     return () => {
       cancelled = true;
+      window.clearInterval(intervalId);
+      timeouts.forEach((id) => window.clearTimeout(id));
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [config, statusLoaded]);
+  }, [config, refreshStatus]);
 
   useEffect(() => {
     if (!saveStatus) return;
@@ -290,6 +372,29 @@ export default function ProxyPage() {
     return dedupe(rows.flatMap((row) => row.models));
   }, [catalog, editor.allowed_account_ids]);
 
+  const availableModelSites = useMemo(() => {
+    const rows =
+      editor.allowed_account_ids.length === 0
+        ? catalog
+        : catalog.filter((row) => editor.allowed_account_ids.includes(row.account_id));
+    const byModel = new Map<string, string[]>();
+
+    for (const row of rows) {
+      const siteLabel = row.site_name?.trim() || row.account_selector?.trim() || row.account_id;
+      for (const model of row.models ?? []) {
+        if (!model) continue;
+        const current = byModel.get(model) ?? [];
+        if (!current.includes(siteLabel)) {
+          current.push(siteLabel);
+          current.sort((left, right) => left.localeCompare(right));
+          byModel.set(model, current);
+        }
+      }
+    }
+
+    return byModel;
+  }, [catalog, editor.allowed_account_ids]);
+
   const visibleModels = useMemo(() => {
     const keyword = modelSearch.trim().toLowerCase();
     const filteredModels = keyword
@@ -326,15 +431,48 @@ export default function ProxyPage() {
     setSaveStatus(t("proxy.saved"));
   }
 
+  async function persistCliSyncRoutes(routes: ProxyModelRoute[]) {
+    if (!config) return;
+    const nextConfig: AppConfig = {
+      ...config,
+      proxy: {
+        ...config.proxy,
+        model_routes: mergeCliManagedRoutes(config.proxy.model_routes, routes),
+      },
+    };
+    await persistConfig(nextConfig);
+  }
+
   async function handleStart() {
     if (!config) return;
     setLoading(true);
     setError("");
     try {
+      const currentStatus = await refreshStatus();
+      if (currentStatus.running) {
+        return;
+      }
       await request("proxy_start", { config_data: config });
-      setStatus({ running: true });
+      await refreshStatus(false);
     } catch (e) {
-      setError(String(e));
+      const message = String(e);
+      if (/(10048|only one usage of each socket address|通常每个套接字地址)/i.test(message)) {
+        const reachable = await probeLocalProxy(config.proxy.port);
+        if (reachable) {
+          setStatus({ running: true });
+          setStatusLoaded(true);
+          setError("");
+          return;
+        }
+        setError(
+          text(
+            `端口 ${config.proxy.port} 已被其他程序占用，请更换端口或关闭占用进程。`,
+            `Port ${config.proxy.port} is already in use by another program. Change the port or stop the conflicting process.`,
+          ),
+        );
+      } else {
+        setError(message);
+      }
     } finally {
       setLoading(false);
     }
@@ -345,7 +483,7 @@ export default function ProxyPage() {
     setError("");
     try {
       await request("proxy_stop");
-      setStatus({ running: false });
+      await refreshStatus(false);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -610,8 +748,20 @@ export default function ProxyPage() {
           <span className="text-xs text-base-content/50">
             {activeAccounts} {t("proxy.activeAccounts")}
           </span>
-          <span className={`badge badge-sm ${status.running ? "badge-success" : "badge-error"}`}>
-            {status.running ? t("common.running") : t("common.stopped")}
+          <span
+            className={`badge badge-sm ${
+              !statusLoaded
+                ? "badge-ghost"
+                : status.running
+                  ? "badge-success"
+                  : "badge-error"
+            }`}
+          >
+            {!statusLoaded
+              ? text("检测中", "Checking")
+              : status.running
+                ? t("common.running")
+                : t("common.stopped")}
           </span>
           {status.running ? (
             <button className="btn btn-error btn-sm btn-outline gap-1.5" onClick={handleStop} disabled={loading}>
@@ -865,11 +1015,16 @@ curl http://127.0.0.1:${config.proxy.port}/health`}
       )}
 
       {status.running && (
-        <CliSyncCard
-          proxyUrl={`http://127.0.0.1:${config.proxy.port}`}
-          apiKey={config.proxy.api_key}
-          proxyPort={config.proxy.port}
-        />
+      <CliSyncCard
+        proxyUrl={`http://127.0.0.1:${config.proxy.port}`}
+        apiKey={config.proxy.api_key}
+        proxyPort={config.proxy.port}
+        modelCatalog={catalog}
+        persistedCliRoutes={(config.proxy.model_routes ?? []).filter(
+          (route) => route.managed_by === "cli_sync",
+        )}
+        onPersistCliRoutes={persistCliSyncRoutes}
+      />
       )}
 
       {editorOpen && (
@@ -1110,7 +1265,14 @@ curl http://127.0.0.1:${config.proxy.port}/health`}
                             onMouseEnter={(event) =>
                               showHoverPreview(
                                 event.currentTarget,
-                                model,
+                                [
+                                  model,
+                                  "",
+                                  text(
+                                    `站点：${(availableModelSites.get(model) ?? []).join("、") || "-"}`,
+                                    `Sites: ${(availableModelSites.get(model) ?? []).join(", ") || "-"}`,
+                                  ),
+                                ].join("\n"),
                                 text("完整模型名", "Full model name"),
                               )
                             }

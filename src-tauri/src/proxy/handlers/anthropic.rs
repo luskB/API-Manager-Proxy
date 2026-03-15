@@ -11,7 +11,7 @@ use std::collections::HashSet;
 
 use crate::proxy::handlers::common::{
     apply_retry_strategy, determine_retry_strategy, effective_max_retries, is_auth_error,
-    rate_limit_duration_for_status, should_rotate_account,
+    merge_account_filters, rate_limit_duration_for_status, should_rotate_account,
 };
 use crate::proxy::handlers::protocol_convert::{
     anthropic_to_openai_request, openai_to_anthropic_response, StreamConverter,
@@ -72,7 +72,10 @@ async fn handle_messages_inner(
 
     // Resolve model alias
     let model = if !model.is_empty() {
-        let resolved = state.model_router.resolve_alias(&model);
+        let resolved = {
+            let router = state.model_router.read().await;
+            router.resolve_alias(&model)
+        };
         if resolved != model {
             tracing::info!(original = %model, resolved = %resolved, "Anthropic: model alias resolved");
         }
@@ -106,7 +109,31 @@ async fn handle_messages_inner(
     let active_count = state.token_manager.active_healthy_count(Some("openai"));
     let max_retries = effective_max_retries(active_count);
     let allowed_accounts = auth_key_allowed_accounts(auth_key.as_ref());
+    let preferred_route_accounts = if model.is_empty() {
+        None
+    } else {
+        let router = state.model_router.read().await;
+        router.preferred_accounts(&model)
+    };
+    let (candidate_accounts, has_route_override) =
+        merge_account_filters(preferred_route_accounts.clone(), allowed_accounts.as_ref());
     let mut last_site_url: Option<String> = None;
+
+    if has_route_override
+        && candidate_accounts
+            .as_ref()
+            .map(|account_ids| account_ids.is_empty())
+            .unwrap_or(false)
+    {
+        return (
+            anthropic_error_response(
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                "This API key is not allowed to access the selected site",
+            ),
+            None,
+        );
+    }
 
     tracing::info!(
         model = %model,
@@ -122,7 +149,7 @@ async fn handle_messages_inner(
             if model.is_empty() { None } else { Some(&model) },
             Some("openai"),
             &failed_accounts,
-            allowed_accounts.as_ref(),
+            candidate_accounts.as_ref(),
         ) {
             Some(t) => {
                 tracing::debug!(
@@ -134,17 +161,30 @@ async fn handle_messages_inner(
                 t
             }
             None => {
+                let message = preferred_route_accounts
+                    .as_ref()
+                    .and_then(|account_ids| account_ids.first())
+                    .and_then(|account_id| {
+                        state.token_manager.explain_account_unavailability(
+                            account_id,
+                            if model.is_empty() { None } else { Some(&model) },
+                            Some("openai"),
+                            &failed_accounts,
+                        )
+                    })
+                    .unwrap_or_else(|| "No available accounts".to_string());
                 tracing::warn!(
                     attempt,
                     failed_count = failed_accounts.len(),
                     model = %model,
+                    reason = %message,
                     "Anthropic→OpenAI: no available accounts"
                 );
                 return (
                     anthropic_error_response(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "overloaded_error",
-                        "No available accounts",
+                        &message,
                     ),
                     last_site_url,
                 );

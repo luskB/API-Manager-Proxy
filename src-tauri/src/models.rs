@@ -205,6 +205,8 @@ pub struct ModelRoute {
     pub account_ids: Vec<String>,
     #[serde(default)]
     pub priority: i32,
+    #[serde(default)]
+    pub managed_by: Option<String>,
 }
 
 /// A proxy API key with per-key settings for multi-user access.

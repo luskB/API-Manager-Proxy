@@ -30,7 +30,7 @@ pub struct AppState {
     pub upstream: Arc<UpstreamClient>,
     pub monitor: Arc<ProxyMonitor>,
     pub security: Arc<RwLock<SecurityConfig>>,
-    pub model_router: Arc<ModelRouter>,
+    pub model_router: Arc<RwLock<ModelRouter>>,
     pub port: u16,
 }
 
@@ -40,6 +40,7 @@ pub struct AxumServer {
     pub token_manager: Arc<TokenManager>,
     pub monitor: Arc<ProxyMonitor>,
     pub security: Arc<RwLock<SecurityConfig>>,
+    pub model_router: Arc<RwLock<ModelRouter>>,
 }
 
 impl AxumServer {
@@ -96,17 +97,17 @@ impl AxumServer {
         }));
 
         // Build model router
-        let model_router = Arc::new(ModelRouter::new(
+        let model_router = Arc::new(RwLock::new(ModelRouter::new(
             config.model_aliases.clone(),
             config.model_routes.clone(),
-        ));
+        )));
 
         let state = AppState {
             token_manager: token_manager.clone(),
             upstream: upstream.clone(),
             monitor: monitor.clone(),
             security: security.clone(),
-            model_router,
+            model_router: model_router.clone(),
             port: config.port,
         };
 
@@ -176,6 +177,7 @@ impl AxumServer {
             token_manager,
             monitor,
             security,
+            model_router,
         })
     }
 

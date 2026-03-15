@@ -10,7 +10,7 @@ use std::collections::HashSet;
 
 use crate::proxy::handlers::common::{
     apply_retry_strategy, determine_retry_strategy, effective_max_retries, is_auth_error,
-    rate_limit_duration_for_status, should_rotate_account,
+    merge_account_filters, rate_limit_duration_for_status, should_rotate_account,
 };
 use crate::proxy::middleware::auth::AuthenticatedKey;
 use crate::proxy::middleware::monitor::UpstreamUrl;
@@ -48,7 +48,28 @@ pub async fn handle_generate(
         state.token_manager.active_healthy_count(Some("gemini")),
     );
     let allowed_accounts = auth_key_allowed_accounts(auth_key.as_ref());
+    let preferred_route_accounts = if let Some(model_name) = model.as_deref() {
+        let router = state.model_router.read().await;
+        router.preferred_accounts(model_name)
+    } else {
+        None
+    };
+    let (candidate_accounts, has_route_override) =
+        merge_account_filters(preferred_route_accounts.clone(), allowed_accounts.as_ref());
     let mut last_site_url: Option<String> = None;
+
+    if has_route_override
+        && candidate_accounts
+            .as_ref()
+            .map(|account_ids| account_ids.is_empty())
+            .unwrap_or(false)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            error_json("This API key is not allowed to access the selected site"),
+        )
+            .into_response();
+    }
 
     for attempt in 0..=max_retries {
         let token = match state.token_manager.get_token_excluding_for_accounts(
@@ -56,13 +77,25 @@ pub async fn handle_generate(
             model.as_deref(),
             Some("gemini"),
             &failed_accounts,
-            allowed_accounts.as_ref(),
+            candidate_accounts.as_ref(),
         ) {
             Some(t) => t,
             None => {
+                let message = preferred_route_accounts
+                    .as_ref()
+                    .and_then(|account_ids| account_ids.first())
+                    .and_then(|account_id| {
+                        state.token_manager.explain_account_unavailability(
+                            account_id,
+                            model.as_deref(),
+                            Some("gemini"),
+                            &failed_accounts,
+                        )
+                    })
+                    .unwrap_or_else(|| "No available accounts".to_string());
                 let mut resp = (
                     StatusCode::SERVICE_UNAVAILABLE,
-                    error_json("No available accounts"),
+                    error_json(&message),
                 )
                     .into_response();
                 if let Some(url) = last_site_url {

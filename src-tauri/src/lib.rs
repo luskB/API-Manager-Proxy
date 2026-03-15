@@ -74,6 +74,7 @@ pub fn run() {
                         let monitor_ref = axum_server.monitor.clone();
                         let token_manager_ref = axum_server.token_manager.clone();
                         let security_ref = axum_server.security.clone();
+                        let model_router_ref = axum_server.model_router.clone();
                         {
                             let mut server = state.server.lock().await;
                             server.set_server(axum_server);
@@ -89,6 +90,10 @@ pub fn run() {
                         {
                             let mut security = state.security.write().await;
                             *security = Some(security_ref);
+                        }
+                        {
+                            let mut model_router = state.model_router.write().await;
+                            *model_router = Some(model_router_ref);
                         }
                         tracing::info!("Proxy server auto-started successfully");
                     }

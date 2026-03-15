@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Bot,
   CodeXml,
@@ -7,6 +7,8 @@ import {
   Search,
   Sparkles,
   Terminal,
+  TriangleAlert,
+  X,
 } from "lucide-react";
 import CliAppCard from "./CliAppCard";
 import ConfigEditorModal from "./ConfigEditorModal";
@@ -34,10 +36,27 @@ interface ClaudeModelConfig {
   reasoningModel: string | null;
 }
 
+interface ProxyModelCatalogRow {
+  account_id: string;
+  account_selector: string;
+  site_name: string;
+  models: string[];
+}
+
+interface CliSyncRoute {
+  model_pattern: string;
+  account_ids: string[];
+  priority: number;
+  managed_by?: string;
+}
+
 interface CliSyncCardProps {
   proxyUrl: string;
   apiKey: string;
   proxyPort: number;
+  modelCatalog: ProxyModelCatalogRow[];
+  persistedCliRoutes?: CliSyncRoute[];
+  onPersistCliRoutes?: (routes: CliSyncRoute[]) => Promise<void>;
 }
 
 interface CliProbeResult {
@@ -59,6 +78,24 @@ interface EditorState {
   content: string;
   isGenerated: boolean;
   isValid: boolean;
+}
+
+interface ConfirmDialogState {
+  title: string;
+  message: string;
+  confirmLabel: string;
+  tone: "primary" | "danger";
+  onConfirm: () => void;
+}
+
+interface CliModelOption {
+  key: string;
+  accountId: string;
+  accountSelector: string;
+  siteName: string;
+  model: string;
+  displayLabel: string;
+  searchText: string;
 }
 
 const CLI_APPS: CliAppType[] = ["Claude", "Codex", "Gemini", "OpenCode", "Droid"];
@@ -137,6 +174,17 @@ function dedupe(values: string[]): string[] {
   return result;
 }
 
+function dedupeModelOptionsByBareModel(options: CliModelOption[]): CliModelOption[] {
+  const seen = new Set<string>();
+  const result: CliModelOption[] = [];
+  for (const option of options) {
+    if (!option.model || seen.has(option.model)) continue;
+    seen.add(option.model);
+    result.push(option);
+  }
+  return result;
+}
+
 function isValidJson(str: string): boolean {
   try {
     JSON.parse(str);
@@ -150,10 +198,22 @@ function initRecord<T>(val: T): Record<CliAppType, T> {
   return { Claude: val, Codex: val, Gemini: val, OpenCode: val, Droid: val };
 }
 
+function buildCliRoutes(options: CliModelOption[]): CliSyncRoute[] {
+  return options.map((option, index) => ({
+    model_pattern: option.model,
+    account_ids: [option.accountId],
+    priority: index,
+    managed_by: "cli_sync",
+  }));
+}
+
 export default function CliSyncCard({
   proxyUrl,
   apiKey,
   proxyPort,
+  modelCatalog,
+  persistedCliRoutes = [],
+  onPersistCliRoutes,
 }: CliSyncCardProps) {
   const [statuses, setStatuses] = useState<Record<CliAppType, CliStatus | null>>(
     initRecord(null),
@@ -170,11 +230,11 @@ export default function CliSyncCard({
   const [probeResults, setProbeResults] = useState<
     Record<CliAppType, CliProbeResult | null>
   >(initRecord(null));
-  const [availableModels, setAvailableModels] = useState<string[]>([]);
-  const [selectedModels, setSelectedModels] = useState<string[]>([]);
-  const [useAllDiscoveredModels, setUseAllDiscoveredModels] = useState(true);
+  const [selectedModelKeys, setSelectedModelKeys] = useState<string[]>([]);
   const [modelFilter, setModelFilter] = useState("");
   const [editorState, setEditorState] = useState<EditorState | null>(null);
+  const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogState | null>(null);
+  const lastHydratedSelectionRef = useRef("");
   const { t, locale } = useLocale();
 
   const text = (zh: string, en: string) => (locale === "zh" ? zh : en);
@@ -191,18 +251,83 @@ export default function CliSyncCard({
     [proxyUrl],
   );
 
-  const visibleModels = useMemo(() => {
+  const modelOptions = useMemo(() => {
+    const options: CliModelOption[] = [];
+    for (const row of modelCatalog) {
+      for (const model of row.models ?? []) {
+        if (!model) continue;
+        const siteName = row.site_name?.trim() || row.account_selector?.trim() || row.account_id;
+        const displayLabel = `${siteName}::${model}`;
+        options.push({
+          key: `${row.account_id}::${model}`,
+          accountId: row.account_id,
+          accountSelector: row.account_selector,
+          siteName,
+          model,
+          displayLabel,
+          searchText: `${displayLabel} ${row.account_selector} ${row.account_id}`.toLowerCase(),
+        });
+      }
+    }
+    return options.sort((left, right) =>
+      left.displayLabel.localeCompare(right.displayLabel),
+    );
+  }, [modelCatalog]);
+
+  const optionMap = useMemo(
+    () => new Map(modelOptions.map((option) => [option.key, option])),
+    [modelOptions],
+  );
+
+  const visibleModelOptions = useMemo(() => {
     const keyword = modelFilter.trim().toLowerCase();
-    if (!keyword) return availableModels;
-    return availableModels.filter((model) => model.toLowerCase().includes(keyword));
-  }, [availableModels, modelFilter]);
+    if (!keyword) return modelOptions;
+    return modelOptions.filter((option) => option.searchText.includes(keyword));
+  }, [modelFilter, modelOptions]);
+
+  const persistedSelectedKeys = useMemo(
+    () =>
+      dedupe(
+        persistedCliRoutes.flatMap((route) => {
+          const accountId = route.account_ids?.[0];
+          const model = route.model_pattern?.trim();
+          if (!accountId || !model) return [];
+          return [`${accountId}::${model}`];
+        }),
+      ),
+    [persistedCliRoutes],
+  );
+
+  const persistedSelectionSignature = useMemo(
+    () => persistedSelectedKeys.join("\u0001"),
+    [persistedSelectedKeys],
+  );
+
+  const effectiveSelectedOptions = useMemo(() => {
+    const ordered = selectedModelKeys
+      .map((key) => optionMap.get(key))
+      .filter((option): option is CliModelOption => Boolean(option));
+    return dedupeModelOptionsByBareModel(ordered);
+  }, [optionMap, selectedModelKeys]);
+
+  const selectedBindingOptions = useMemo(
+    () =>
+      selectedModelKeys
+        .map((key) => optionMap.get(key))
+        .filter((option): option is CliModelOption => Boolean(option)),
+    [optionMap, selectedModelKeys],
+  );
 
   const effectiveModels = useMemo(
-    () => (useAllDiscoveredModels ? availableModels : selectedModels),
-    [availableModels, selectedModels, useAllDiscoveredModels],
+    () => effectiveSelectedOptions.map((option) => option.model),
+    [effectiveSelectedOptions],
   );
 
   const defaultModel = effectiveModels[0] ?? null;
+  const allModelsSelected =
+    modelOptions.length > 0 && selectedModelKeys.length === modelOptions.length;
+  const useAllDiscoveredModels = allModelsSelected;
+  const duplicateSiteBindings: string[] = [];
 
   const getClaudeModels = useCallback(
     (models: string[]): ClaudeModelConfig | null => {
@@ -244,33 +369,39 @@ export default function CliSyncCard({
   );
 
   useEffect(() => {
-    request<string[]>("get_available_models")
-      .then((models) => setAvailableModels(dedupe(models ?? [])))
-      .catch(() => {});
-  }, []);
+    if (persistedSelectionSignature === lastHydratedSelectionRef.current) {
+      return;
+    }
+
+    const hydrated =
+      optionMap.size > 0
+        ? persistedSelectedKeys.filter((key) => optionMap.has(key))
+        : persistedSelectedKeys;
+    setSelectedModelKeys(hydrated);
+    lastHydratedSelectionRef.current = persistedSelectionSignature;
+  }, [optionMap, persistedSelectedKeys, persistedSelectionSignature]);
 
   useEffect(() => {
-    setSelectedModels((prev) =>
-      prev.filter((model) => availableModels.includes(model)),
-    );
-  }, [availableModels]);
+    if (optionMap.size === 0) return;
+    setSelectedModelKeys((prev) => prev.filter((key) => optionMap.has(key)));
+  }, [optionMap]);
 
   useEffect(() => {
     CLI_APPS.forEach(checkStatus);
   }, [checkStatus]);
 
-  const toggleSelectedModel = (model: string) => {
-    setUseAllDiscoveredModels(false);
-    setSelectedModels((prev) =>
-      prev.includes(model)
-        ? prev.filter((item) => item !== model)
-        : [...prev, model],
+  const toggleSelectedModel = (optionKey: string) => {
+    setSelectedModelKeys((prev) =>
+      prev.includes(optionKey)
+        ? prev.filter((item) => item !== optionKey)
+        : [...prev, optionKey],
     );
   };
 
   const selectVisibleModels = () => {
-    setUseAllDiscoveredModels(false);
-    setSelectedModels((prev) => dedupe([...prev, ...visibleModels]));
+    setSelectedModelKeys((prev) =>
+      dedupe([...prev, ...visibleModelOptions.map((option) => option.key)]),
+    );
   };
 
   const syncAllModels = () => {
@@ -284,8 +415,7 @@ export default function CliSyncCard({
     ) {
       return;
     }
-    setUseAllDiscoveredModels(true);
-    setSelectedModels([]);
+    setSelectedModelKeys(modelOptions.map((option) => option.key));
   };
 
   const clearSelectedModels = () => {
@@ -293,14 +423,48 @@ export default function CliSyncCard({
       !window.confirm(
         text(
           "确认移除当前已选模型吗？移除后需要重新从列表中勾选要同步的模型。",
-          "Remove all currently selected models? You can reselect the models you want to sync from the list.",
+          "Remove all currently selected models? You can reselect them from the list later.",
         ),
       )
     ) {
       return;
     }
-    setUseAllDiscoveredModels(false);
-    setSelectedModels([]);
+    setSelectedModelKeys([]);
+  };
+
+  void syncAllModels;
+  void clearSelectedModels;
+
+  const requestSyncAllModels = () => {
+    setConfirmDialog({
+      title: text("同步全部模型", "Sync all models"),
+      message: text(
+        "这会把当前已发现的全部站点模型加入同步列表。",
+        "This will add every discovered site-model binding to the sync list.",
+      ),
+      confirmLabel: text("同步全部", "Sync all"),
+      tone: "primary",
+      onConfirm: () => {
+        setSelectedModelKeys(modelOptions.map((option) => option.key));
+        setConfirmDialog(null);
+      },
+    });
+  };
+
+  const requestClearSelectedModels = () => {
+    setConfirmDialog({
+      title: text("移除全部已选模型", "Remove all selected models"),
+      message: text(
+        "这会清空当前模型同步列表，之后可以再按需要重新添加。",
+        "This clears the current sync list. You can add models again later.",
+      ),
+      confirmLabel: text("全部移除", "Remove all"),
+      tone: "danger",
+      onConfirm: () => {
+        setSelectedModelKeys([]);
+        setConfirmDialog(null);
+      },
+    });
   };
 
   const handleSync = async (app: CliAppType) => {
@@ -353,6 +517,10 @@ export default function CliSyncCard({
     const { app, fileName, content } = editorState;
     setSyncing((prev) => ({ ...prev, [app]: true }));
     try {
+      if (editorState.isGenerated && onPersistCliRoutes) {
+        await onPersistCliRoutes(buildCliRoutes(effectiveSelectedOptions));
+      }
+
       await request("write_cli_config", { appType: app, fileName, content });
       for (const file of editorState.allFiles) {
         if (file === fileName) continue;
@@ -486,8 +654,8 @@ export default function CliSyncCard({
             </div>
             <p className="mt-1 text-xs text-base-content/55">
               {text(
-                "在这里选中的模型会一起写入 OpenCode、Claude Code 等 CLI 配置。单模型工具会优先使用第一个选中的模型。",
-                "Selected models will be written into compatible CLI configs together. Single-model CLIs use the first selected model as their default.",
+                "这里显示为“站点名::模型名”，便于区分来源；真正写入 OpenCode、Claude Code 等 CLI 的仍然只是裸模型名。",
+                "The list shows site name plus model, but CLI configs still receive bare model names only.",
               )}
             </p>
           </div>
@@ -495,20 +663,20 @@ export default function CliSyncCard({
             {useAllDiscoveredModels ? (
               <span>
                 {text(
-                  "当前将同步全部已发现模型",
-                  "All discovered models will be synced",
+                  "当前将同步全部已发现站点模型",
+                  "All discovered site-model bindings will be synced",
                 )}
               </span>
-            ) : selectedModels.length > 0 ? (
+            ) : selectedModelKeys.length > 0 ? (
               <span>
-                {text("已选择", "Selected")} {selectedModels.length}{" "}
-                {text("个模型", "models")}
+                {text("已选择", "Selected")} {selectedModelKeys.length}{" "}
+                {text("个站点模型", "site-model bindings")}
               </span>
             ) : (
               <span>
                 {text(
-                  "当前未选择模型，点击同步时只会写入地址和密钥",
-                  "No models are selected right now, so syncing will only write the endpoint and API key.",
+                  "当前未选择模型，点击同步时只会写入地址和密钥。",
+                  "No models are selected, so syncing only writes the endpoint and API key.",
                 )}
               </span>
             )}
@@ -525,7 +693,7 @@ export default function CliSyncCard({
             <Search size={14} className="text-base-content/45" />
             <input
               className="grow bg-transparent"
-              placeholder={text("搜索模型", "Search models")}
+              placeholder={text("搜索站点或模型", "Search sites or models")}
               value={modelFilter}
               onChange={(event) => setModelFilter(event.target.value)}
             />
@@ -536,29 +704,81 @@ export default function CliSyncCard({
               className="btn btn-outline btn-sm"
               onClick={selectVisibleModels}
               type="button"
-              disabled={visibleModels.length === 0}
+              disabled={visibleModelOptions.length === 0}
             >
               {text("添加当前结果", "Add visible")}
             </button>
             <button
               className="btn btn-ghost btn-sm"
-              onClick={syncAllModels}
+              onClick={requestSyncAllModels}
               type="button"
             >
               {text("同步全部", "Use all")}
             </button>
             <button
               className="btn btn-ghost btn-sm text-error"
-              onClick={clearSelectedModels}
+              onClick={requestClearSelectedModels}
               type="button"
-              disabled={selectedModels.length === 0}
+              disabled={selectedModelKeys.length === 0}
             >
               {text("全部移除", "Remove all")}
             </button>
           </div>
         </div>
 
-        {availableModels.length === 0 ? (
+        {selectedBindingOptions.length > 0 && (
+          <div className="mt-4 rounded-2xl border border-base-300 bg-base-200/30 p-3">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="text-xs font-semibold uppercase tracking-[0.12em] text-base-content/55">
+                  {text("已选模型", "Selected models")}
+                </div>
+                <div className="mt-1 text-xs text-base-content/45">
+                  {text(
+                    "这些模型会作为当前 CLI 同步目标保留下来，重启后也会按已保存配置回显。",
+                    "These bindings stay as your current CLI sync targets and will be restored from saved config.",
+                  )}
+                </div>
+              </div>
+              <div className="text-xs text-base-content/50">
+                {selectedBindingOptions.length} {text("项", "items")}
+              </div>
+            </div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              {selectedBindingOptions.map((option) => (
+                <button
+                  key={`selected-${option.key}`}
+                  type="button"
+                  onClick={() => toggleSelectedModel(option.key)}
+                  className="inline-flex max-w-full items-center gap-2 rounded-full border border-primary/20 bg-primary/10 px-3 py-1.5 text-xs text-primary transition hover:border-primary/40 hover:bg-primary/15"
+                  title={option.displayLabel}
+                >
+                  <span className="truncate font-mono">{option.displayLabel}</span>
+                  <X size={12} className="shrink-0" />
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {duplicateSiteBindings.length > 0 && (
+          <div className="mt-3 rounded-xl border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning-content/80">
+            <div className="flex items-start gap-2">
+              <TriangleAlert size={14} className="mt-0.5 shrink-0" />
+              <div>
+                {text(
+                  "发现同名模型来自多个站点。写入 CLI 时仍然只能使用裸模型名，因此会以你最先选中的站点为准。",
+                  "Some bare model names exist on multiple sites. CLI tools still use the bare model only, so the first selected site wins.",
+                )}
+                <div className="mt-1 font-mono text-[11px] break-words">
+                  {duplicateSiteBindings.join(", ")}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {modelOptions.length === 0 ? (
           <div className="mt-4 rounded-xl border border-dashed border-base-300 px-4 py-5 text-sm text-base-content/50">
             {text(
               "暂时还没有发现可同步的模型，请先让代理加载模型列表。",
@@ -566,24 +786,29 @@ export default function CliSyncCard({
             )}
           </div>
         ) : (
-          <div className="mt-4 grid max-h-52 grid-cols-1 gap-2 overflow-y-auto pr-1 md:grid-cols-2 xl:grid-cols-3">
-            {visibleModels.map((model) => {
-              const selected = selectedModels.includes(model);
+          <div className="mt-4 grid max-h-56 grid-cols-1 gap-2 overflow-y-auto pr-1 md:grid-cols-2 xl:grid-cols-3">
+            {visibleModelOptions.map((option) => {
+              const selected = selectedModelKeys.includes(option.key);
               return (
                 <button
-                  key={model}
+                  key={option.key}
                   type="button"
-                  onClick={() => toggleSelectedModel(model)}
+                  onClick={() => toggleSelectedModel(option.key)}
                   className={cn(
                     "flex items-center justify-between gap-3 rounded-xl border px-3 py-2 text-left transition-colors",
                     selected
                       ? "border-primary bg-primary/10 text-primary"
                       : "border-base-300 bg-base-200/30 hover:border-primary/35 hover:bg-base-200/60",
                   )}
-                  title={model}
+                  title={option.displayLabel}
                 >
-                  <span className="min-w-0 truncate font-mono text-xs">
-                    {model}
+                  <span className="min-w-0">
+                    <span className="block truncate font-mono text-xs">
+                      {option.displayLabel}
+                    </span>
+                    <span className="block truncate text-[11px] text-base-content/45">
+                      {option.accountSelector || option.accountId}
+                    </span>
                   </span>
                   <span
                     className={cn(
@@ -621,6 +846,53 @@ export default function CliSyncCard({
           />
         ))}
       </div>
+
+      {confirmDialog && (
+        <div className="fixed inset-0 z-[90] flex items-center justify-center bg-slate-950/35 px-4 backdrop-blur-[2px]">
+          <div className="w-full max-w-md rounded-3xl border border-base-300 bg-base-100 p-5 shadow-2xl">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <div className="text-xs font-semibold uppercase tracking-[0.16em] text-base-content/45">
+                  {text("请确认", "Please confirm")}
+                </div>
+                <h3 className="mt-1 text-lg font-semibold text-base-content">
+                  {confirmDialog.title}
+                </h3>
+              </div>
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm btn-circle"
+                onClick={() => setConfirmDialog(null)}
+                aria-label={text("关闭", "Close")}
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <p className="mt-3 text-sm leading-6 text-base-content/70">
+              {confirmDialog.message}
+            </p>
+            <div className="mt-5 flex items-center justify-end gap-3">
+              <button
+                type="button"
+                className="btn btn-ghost"
+                onClick={() => setConfirmDialog(null)}
+              >
+                {text("取消", "Cancel")}
+              </button>
+              <button
+                type="button"
+                className={cn(
+                  "btn",
+                  confirmDialog.tone === "danger" ? "btn-error" : "btn-primary",
+                )}
+                onClick={confirmDialog.onConfirm}
+              >
+                {confirmDialog.confirmLabel}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {editorState && (
         <ConfigEditorModal
