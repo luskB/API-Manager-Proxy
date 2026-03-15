@@ -129,6 +129,7 @@ pub fn run() {
             commands::get_proxy_stats,
             commands::get_proxy_stats_view,
             commands::get_proxy_model_catalog,
+            commands::get_proxy_model_prices,
             commands::validate_api_key,
             commands::list_hub_accounts,
             commands::refresh_hub_balances,

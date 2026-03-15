@@ -4,11 +4,13 @@ import type { AppConfig } from "../types/backup";
 import {
   Check,
   Copy,
+  DollarSign,
   KeyRound,
   Pencil,
   Play,
   Plus,
   Save,
+  Search,
   Square,
   Trash2,
   X,
@@ -27,6 +29,11 @@ interface ProxyModelCatalogRow {
   account_selector: string;
   site_name: string;
   models: string[];
+}
+
+interface ProxyModelPriceQuote {
+  input_per_million: number;
+  output_per_million: number;
 }
 
 type ProxyUserKey = NonNullable<AppConfig["proxy"]["api_keys"]>[number];
@@ -69,6 +76,13 @@ function maskKey(value: string): string {
   return `${value.slice(0, 8)}...${value.slice(-4)}`;
 }
 
+function formatUsdPerMillion(value: number): string {
+  if (value >= 10) return value.toFixed(2);
+  if (value >= 1) return value.toFixed(3);
+  if (value >= 0.1) return value.toFixed(4);
+  return value.toFixed(6);
+}
+
 export default function ProxyPage() {
   const { config, setConfig, error, setError } = useConfig();
   const [status, setStatus] = useState<ProxyStatus>({ running: false });
@@ -77,10 +91,13 @@ export default function ProxyPage() {
   const [saveStatus, setSaveStatus] = useState("");
   const [catalog, setCatalog] = useState<ProxyModelCatalogRow[]>([]);
   const [catalogLoading, setCatalogLoading] = useState(false);
+  const [modelPrices, setModelPrices] = useState<Record<string, ProxyModelPriceQuote>>({});
   const [editorOpen, setEditorOpen] = useState(false);
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
   const [editor, setEditor] = useState<ProxyKeyEditor>(defaultEditor);
   const [editorBusy, setEditorBusy] = useState(false);
+  const [modelSearchInput, setModelSearchInput] = useState("");
+  const [modelSearch, setModelSearch] = useState("");
   const { t, locale } = useLocale();
 
   const text = (zh: string, en: string) => (locale === "zh" ? zh : en);
@@ -136,6 +153,31 @@ export default function ProxyPage() {
     };
   }, [config?.proxy_accounts]);
 
+  useEffect(() => {
+    const models = dedupe(catalog.flatMap((row) => row.models));
+    if (models.length === 0) {
+      setModelPrices({});
+      return;
+    }
+
+    let cancelled = false;
+    request<Record<string, ProxyModelPriceQuote>>("get_proxy_model_prices", { models })
+      .then((prices) => {
+        if (!cancelled) {
+          setModelPrices(prices ?? {});
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setModelPrices({});
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [catalog]);
+
   const proxyKeys = config?.proxy.api_keys ?? [];
   const activeAccounts = config?.proxy_accounts.filter((a) => !a.disabled).length ?? 0;
 
@@ -160,6 +202,14 @@ export default function ProxyPage() {
         : catalog.filter((row) => editor.allowed_account_ids.includes(row.account_id));
     return dedupe(rows.flatMap((row) => row.models));
   }, [catalog, editor.allowed_account_ids]);
+
+  const visibleModels = useMemo(() => {
+    const keyword = modelSearch.trim().toLowerCase();
+    if (!keyword) {
+      return availableModels;
+    }
+    return availableModels.filter((model) => model.toLowerCase().includes(keyword));
+  }, [availableModels, modelSearch]);
 
   async function persistConfig(nextConfig: AppConfig) {
     await request("save_config", { config_data: nextConfig });
@@ -207,6 +257,8 @@ export default function ProxyPage() {
   function openCreateKey() {
     setEditingIndex(null);
     setEditor(defaultEditor());
+    setModelSearchInput("");
+    setModelSearch("");
     setEditorOpen(true);
   }
 
@@ -224,6 +276,8 @@ export default function ProxyPage() {
       allowed_models: [...key.allowed_models],
       created_at: key.created_at,
     });
+    setModelSearchInput("");
+    setModelSearch("");
     setEditorOpen(true);
   }
 
@@ -232,6 +286,8 @@ export default function ProxyPage() {
     setEditorOpen(false);
     setEditingIndex(null);
     setEditor(defaultEditor());
+    setModelSearchInput("");
+    setModelSearch("");
   }
 
   function toggleSite(accountId: string) {
@@ -259,6 +315,26 @@ export default function ProxyPage() {
         ? prev.allowed_models.filter((value) => value !== model)
         : [...prev.allowed_models, model],
     }));
+  }
+
+  function applyModelSearch() {
+    setModelSearch(modelSearchInput.trim());
+  }
+
+  function clearModelSearch() {
+    setModelSearchInput("");
+    setModelSearch("");
+  }
+
+  function priceTooltip(model: string): string {
+    const price = modelPrices[model];
+    if (!price) {
+      return text("Pricing unavailable", "Pricing unavailable");
+    }
+    return text(
+      `输入 $${formatUsdPerMillion(price.input_per_million)}/1M · 输出 $${formatUsdPerMillion(price.output_per_million)}/1M`,
+      `Input $${formatUsdPerMillion(price.input_per_million)}/1M · Output $${formatUsdPerMillion(price.output_per_million)}/1M`,
+    );
   }
 
   async function saveEditor() {
@@ -765,8 +841,32 @@ curl http://127.0.0.1:${config.proxy.port}/health`}
                       {text("Selected models", "Selected models")}:{" "}
                       {editor.allowed_models.length || text("All models", "All models")}
                     </div>
+                    <div className="text-xs text-base-content/40 mt-1">
+                      {text("Visible results", "Visible results")}: {visibleModels.length}/{availableModels.length}
+                    </div>
                   </div>
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <div className="join">
+                      <input
+                        className="input input-bordered input-sm join-item w-44 md:w-56"
+                        placeholder={text("Search models", "Search models")}
+                        value={modelSearchInput}
+                        onChange={(e) => setModelSearchInput(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            applyModelSearch();
+                          }
+                        }}
+                      />
+                      <button className="btn btn-outline btn-sm join-item" onClick={applyModelSearch} type="button">
+                        <Search size={14} />
+                      </button>
+                      {(modelSearchInput || modelSearch) && (
+                        <button className="btn btn-ghost btn-sm join-item" onClick={clearModelSearch} type="button">
+                          <X size={14} />
+                        </button>
+                      )}
+                    </div>
                     <button
                       className="btn btn-outline btn-xs"
                       onClick={() => setEditor((prev) => ({ ...prev, allowed_models: availableModels }))}
@@ -792,20 +892,41 @@ curl http://127.0.0.1:${config.proxy.port}/health`}
                       "No models available yet. Fetch models from your sites first.",
                     )}
                   </div>
+                ) : visibleModels.length === 0 ? (
+                  <div className="rounded-lg border border-dashed border-base-300 px-4 py-6 text-sm text-base-content/50">
+                    {text("No models matched your search.", "No models matched your search.")}
+                  </div>
                 ) : (
                   <div className="grid grid-cols-1 gap-2 max-h-[26rem] overflow-y-auto pr-1">
-                    {availableModels.map((model) => (
+                    {visibleModels.map((model) => (
                       <label
                         key={model}
-                        className="flex items-center gap-3 rounded-lg border border-base-300 px-3 py-2 text-sm font-mono"
+                        className="flex items-center justify-between gap-3 rounded-lg border border-base-300 px-3 py-2 text-sm font-mono"
                       >
-                        <input
-                          type="checkbox"
-                          className="checkbox checkbox-sm"
-                          checked={editor.allowed_models.includes(model)}
-                          onChange={() => toggleModel(model)}
-                        />
-                        <span className="truncate">{model}</span>
+                        <span className="flex min-w-0 flex-1 items-center gap-3">
+                          <input
+                            type="checkbox"
+                            className="checkbox checkbox-sm"
+                            checked={editor.allowed_models.includes(model)}
+                            onChange={() => toggleModel(model)}
+                          />
+                          <span className="truncate">{model}</span>
+                        </span>
+                        <button
+                          className="btn btn-ghost btn-xs tooltip tooltip-left"
+                          data-tip={priceTooltip(model)}
+                          type="button"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                          }}
+                          aria-label={priceTooltip(model)}
+                        >
+                          <DollarSign
+                            size={14}
+                            className={modelPrices[model] ? "text-success" : "text-base-content/30"}
+                          />
+                        </button>
                       </label>
                     ))}
                   </div>

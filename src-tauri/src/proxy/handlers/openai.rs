@@ -13,7 +13,9 @@ use crate::proxy::handlers::common::{
     rate_limit_duration_for_status, should_rotate_account,
 };
 use crate::proxy::middleware::auth::AuthenticatedKey;
-use crate::proxy::middleware::monitor::{EffectiveModel, EffectiveRequestBody, UpstreamUrl};
+use crate::proxy::middleware::monitor::{
+    EffectiveAccountId, EffectiveModel, EffectiveRequestBody, UpstreamUrl,
+};
 use crate::proxy::server::AppState;
 
 const MODEL_PREFIX_SEP: &str = "::";
@@ -192,7 +194,7 @@ pub async fn forward_with_retry(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let (mut response, upstream_url, effective_model, effective_request_body) =
+    let (mut response, upstream_url, effective_model, effective_request_body, effective_account_id) =
         forward_with_retry_inner(state, auth_key, path, headers, body).await;
     if let Some(url) = upstream_url {
         response.extensions_mut().insert(UpstreamUrl(url));
@@ -203,6 +205,9 @@ pub async fn forward_with_retry(
     if let Some(body) = effective_request_body {
         response.extensions_mut().insert(EffectiveRequestBody(body));
     }
+    if let Some(account_id) = effective_account_id {
+        response.extensions_mut().insert(EffectiveAccountId(account_id));
+    }
     response
 }
 
@@ -212,7 +217,13 @@ async fn forward_with_retry_inner(
     path: &str,
     headers: HeaderMap,
     body: Bytes,
-) -> (Response, Option<String>, Option<String>, Option<String>) {
+) -> (
+    Response,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
     let is_stream = extract_stream_flag(&body);
     let original_model = extract_model(&body);
     let mut requested_raw_model: Option<String> = None;
@@ -261,6 +272,7 @@ async fn forward_with_retry_inner(
     let mut last_site_url: Option<String> = None;
     let mut last_effective_model: Option<String> = None;
     let mut last_effective_request_body: Option<String> = None;
+    let mut last_account_id: Option<String> = None;
     let body_template = body;
     let forced_route = forced_account_id.is_some();
 
@@ -276,6 +288,7 @@ async fn forward_with_retry_inner(
                 last_site_url,
                 last_effective_model,
                 last_effective_request_body,
+                last_account_id,
             );
         }
     }
@@ -285,16 +298,17 @@ async fn forward_with_retry_inner(
             "Forced account {} is no longer active. Refresh the model list and try again.",
             forced_account_selector.as_deref().unwrap_or("(unknown)")
         );
-        return (
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                error_json(&message),
-            )
-                .into_response(),
-            last_site_url,
-            last_effective_model,
-            last_effective_request_body,
-        );
+            return (
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    error_json(&message),
+                )
+                    .into_response(),
+                last_site_url,
+                last_effective_model,
+                last_effective_request_body,
+                last_account_id,
+            );
     }
 
     if let Some(account_id) = forced_account_id.as_deref() {
@@ -308,6 +322,7 @@ async fn forward_with_retry_inner(
                 last_site_url,
                 last_effective_model,
                 last_effective_request_body,
+                last_account_id,
             );
         }
     }
@@ -360,6 +375,7 @@ async fn forward_with_retry_inner(
                     last_site_url,
                     last_effective_model,
                     last_effective_request_body,
+                    last_account_id,
                 );
             }
         };
@@ -408,6 +424,7 @@ async fn forward_with_retry_inner(
         last_effective_request_body = Some(truncate_body_snapshot(&request_body));
 
         last_site_url = Some(token.site_url.clone());
+        last_account_id = Some(token.account_id.clone());
 
         let result = state
             .upstream
@@ -434,6 +451,7 @@ async fn forward_with_retry_inner(
                             last_site_url,
                             last_effective_model,
                             last_effective_request_body,
+                            last_account_id,
                         );
                     }
                     return (
@@ -441,6 +459,7 @@ async fn forward_with_retry_inner(
                         last_site_url,
                         last_effective_model,
                         last_effective_request_body,
+                        last_account_id,
                     );
                 }
 
@@ -487,6 +506,7 @@ async fn forward_with_retry_inner(
                             last_site_url,
                             last_effective_model,
                             last_effective_request_body,
+                            last_account_id,
                         );
                     }
 
@@ -497,6 +517,7 @@ async fn forward_with_retry_inner(
                             last_site_url,
                             last_effective_model,
                             last_effective_request_body,
+                            last_account_id,
                         );
                     }
                     tracing::warn!(
@@ -522,6 +543,7 @@ async fn forward_with_retry_inner(
                         last_site_url,
                         last_effective_model,
                         last_effective_request_body,
+                        last_account_id,
                     );
                 } else if status >= 500 {
                     state.token_manager.mark_failed(&token.account_id);
@@ -531,6 +553,7 @@ async fn forward_with_retry_inner(
                     last_site_url,
                     last_effective_model,
                     last_effective_request_body,
+                    last_account_id,
                 );
             }
             Err(e) => {
@@ -563,6 +586,7 @@ async fn forward_with_retry_inner(
                         last_site_url,
                         last_effective_model,
                         last_effective_request_body,
+                        last_account_id,
                     );
                 }
             }
@@ -578,6 +602,7 @@ async fn forward_with_retry_inner(
         last_site_url,
         last_effective_model,
         last_effective_request_body,
+        last_account_id,
     )
 }
 

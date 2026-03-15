@@ -22,6 +22,7 @@ const COMMAND_MAPPING: CommandMapping = {
   get_proxy_stats: { url: "/api/proxy/stats", method: "GET" },
   get_proxy_stats_view: { url: "/api/proxy/stats/view", method: "POST" },
   get_proxy_model_catalog: { url: "/api/proxy/models/catalog", method: "GET" },
+  get_proxy_model_prices: { url: "/api/proxy/models/prices", method: "POST" },
   get_cli_sync_status: { url: "/api/cli/status", method: "POST" },
   execute_cli_sync: { url: "/api/cli/sync", method: "POST" },
   execute_cli_restore: { url: "/api/cli/restore", method: "POST" },

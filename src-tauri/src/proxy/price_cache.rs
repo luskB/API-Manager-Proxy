@@ -3,7 +3,7 @@
 //! Startup: fetch once. Refresh every 24h (checked in auto_cleanup timer).
 //! Network failure is completely silent and does not affect proxying.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
@@ -13,7 +13,7 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const COST_PER_MILLION_TOKENS: f64 = 1_000_000.0;
 
 /// Cost per token for a model.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ModelPrice {
     pub input_cost_per_token: f64,
     pub output_cost_per_token: f64,
@@ -125,6 +125,16 @@ impl PriceCache {
                 let cost = price.input_cost_per_token * input_tokens as f64
                     + price.output_cost_per_token * output_tokens as f64;
                 return Some(cost);
+            }
+        }
+        None
+    }
+
+    pub fn get_price(&self, model: &str) -> Option<ModelPrice> {
+        let guard = self.prices.read().ok()?;
+        for candidate in model_lookup_candidates(model) {
+            if let Some(price) = guard.get(&candidate) {
+                return Some(price.clone());
             }
         }
         None

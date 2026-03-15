@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -789,12 +789,20 @@ pub async fn get_proxy_stats() -> Result<serde_json::Value, String> {
 
 #[tauri::command]
 pub async fn get_proxy_stats_view(scope: Option<String>) -> Result<serde_json::Value, String> {
+    refresh_site_price_cache_if_needed().await;
+    refresh_price_cache_if_needed().await;
     let scope = scope
         .as_deref()
         .and_then(StatsScope::parse)
         .unwrap_or(StatsScope::Daily);
     let stats = crate::proxy::proxy_stats::global().get_scoped_stats(scope);
     serde_json::to_value(&stats).map_err(|e| format!("Failed to serialize scoped stats: {}", e))
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProxyModelPriceQuote {
+    pub input_per_million: f64,
+    pub output_per_million: f64,
 }
 
 #[tauri::command]
@@ -822,11 +830,94 @@ pub async fn get_proxy_model_catalog(
     Ok(tm.get_models_by_account().await)
 }
 
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_proxy_model_prices(
+    models: Vec<String>,
+) -> Result<HashMap<String, ProxyModelPriceQuote>, String> {
+    refresh_price_cache_if_needed().await;
+
+    let cache = crate::proxy::price_cache::global();
+    let mut prices = HashMap::new();
+    for model in models {
+        let key = model.trim();
+        if key.is_empty() || prices.contains_key(key) {
+            continue;
+        }
+        if let Some(price) = cache.get_price(key) {
+            prices.insert(
+                key.to_string(),
+                ProxyModelPriceQuote {
+                    input_per_million: price.input_cost_per_token * 1_000_000.0,
+                    output_per_million: price.output_cost_per_token * 1_000_000.0,
+                },
+            );
+        }
+    }
+
+    Ok(prices)
+}
+
 fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+async fn refresh_price_cache_if_needed() {
+    let cache = crate::proxy::price_cache::global();
+    if cache.is_empty() || cache.needs_refresh() {
+        cache.refresh().await;
+    }
+}
+
+async fn refresh_site_price_cache_if_needed() {
+    let cfg = config::load_app_config();
+    if cfg.proxy_accounts.is_empty() {
+        return;
+    }
+
+    let cache = crate::proxy::site_price_cache::global();
+    let pending_accounts: Vec<SiteAccount> = cfg
+        .proxy_accounts
+        .into_iter()
+        .filter(|account| cache.needs_refresh(&account.id))
+        .collect();
+    if pending_accounts.is_empty() {
+        return;
+    }
+
+    let Ok(client) = hub_http_client(cfg.proxy.request_timeout) else {
+        return;
+    };
+
+    let mut handles = Vec::with_capacity(pending_accounts.len());
+    for account in pending_accounts {
+        let client = client.clone();
+        handles.push(tokio::spawn(async move {
+            let result = hub_service::fetch_model_pricing(&client, &account).await;
+            (account.id, account.site_name, result)
+        }));
+    }
+
+    for handle in handles {
+        match handle.await {
+            Ok((account_id, _site_name, Ok(payload))) => {
+                cache.set_account_pricing(&account_id, &payload);
+            }
+            Ok((account_id, site_name, Err(error))) => {
+                tracing::debug!(
+                    account_id = %account_id,
+                    site_name = %site_name,
+                    error = %error,
+                    "Failed to refresh site pricing cache"
+                );
+            }
+            Err(error) => {
+                tracing::debug!(error = %error, "Site pricing refresh task failed");
+            }
+        }
+    }
 }
 
 fn hub_http_client(timeout_secs: u64) -> Result<reqwest::Client, String> {

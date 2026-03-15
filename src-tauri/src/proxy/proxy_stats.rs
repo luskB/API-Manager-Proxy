@@ -189,6 +189,17 @@ fn event_effective_cost(event: &StatsEvent) -> f64 {
         return event.estimated_cost;
     };
 
+    if let Some(account_id) = event.account_id.as_deref().filter(|value| !value.is_empty()) {
+        if let Some(cost) = crate::proxy::site_price_cache::global().estimate_cost(
+            account_id,
+            model,
+            event.input_tokens as i32,
+            event.output_tokens as i32,
+        ) {
+            return cost;
+        }
+    }
+
     crate::proxy::price_cache::global()
         .estimate_cost(model, event.input_tokens as i32, event.output_tokens as i32)
         .unwrap_or(event.estimated_cost)
@@ -221,7 +232,27 @@ impl StatsAccumulator {
         let is_success = log.status >= 200 && log.status < 400;
         let input = log.input_tokens.unwrap_or(0) as i64;
         let output = log.output_tokens.unwrap_or(0) as i64;
-        let cost = log.estimated_cost.unwrap_or(0.0);
+        let cost = log.estimated_cost.unwrap_or_else(|| {
+            log.account_id
+                .as_deref()
+                .and_then(|account_id| {
+                    log.model.as_deref().and_then(|model| {
+                        crate::proxy::site_price_cache::global().estimate_cost(
+                            account_id,
+                            model,
+                            input as i32,
+                            output as i32,
+                        )
+                    })
+                })
+                .or_else(|| {
+                    log.model.as_deref().and_then(|model| {
+                        crate::proxy::price_cache::global()
+                            .estimate_cost(model, input as i32, output as i32)
+                    })
+                })
+                .unwrap_or(0.0)
+        });
 
         // Update global
         data.global.total_requests += 1;

@@ -10,5 +10,6 @@ pub mod price_cache;
 pub mod proxy_stats;
 pub mod rate_limit;
 pub mod server;
+pub mod site_price_cache;
 pub mod token_manager;
 pub mod upstream;

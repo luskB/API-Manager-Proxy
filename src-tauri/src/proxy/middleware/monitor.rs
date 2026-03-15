@@ -4,7 +4,8 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use futures::StreamExt;
 use http_body_util::BodyExt;
 use std::sync::Arc;
 use std::time::Instant;
@@ -24,8 +25,28 @@ pub struct EffectiveModel(pub String);
 #[derive(Clone)]
 pub struct EffectiveRequestBody(pub String);
 
+/// Extension type set by handlers to pass the selected upstream account id.
+#[derive(Clone)]
+pub struct EffectiveAccountId(pub String);
+
 /// Max bytes of request/response body to store per log entry.
 const BODY_TRUNCATE_BYTES: usize = 4096;
+
+struct StreamLogContext {
+    id: String,
+    timestamp: i64,
+    method: String,
+    url: String,
+    status: u16,
+    duration_ms: u64,
+    model: Option<String>,
+    account_id: Option<String>,
+    upstream_url: Option<String>,
+    client_ip: Option<String>,
+    request_body: Option<String>,
+    original_request_body: Option<String>,
+    api_key: Option<String>,
+}
 
 /// Middleware that records request/response metadata into ProxyMonitor.
 pub async fn monitor_middleware(
@@ -67,6 +88,33 @@ pub async fn monitor_middleware(
         .get::<EffectiveRequestBody>()
         .map(|b| b.0.clone())
         .or_else(|| req_body_snapshot.clone());
+    let effective_account_id = response
+        .extensions()
+        .get::<EffectiveAccountId>()
+        .map(|account| account.0.clone());
+    let upstream_url = response.extensions().get::<UpstreamUrl>().map(|u| u.0.clone());
+
+    if is_sse_response(&response) {
+        return wrap_sse_response(
+            monitor.clone(),
+            response,
+            StreamLogContext {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: chrono::Utc::now().timestamp(),
+                method,
+                url,
+                status,
+                duration_ms,
+                model: effective_model,
+                account_id: effective_account_id,
+                upstream_url,
+                client_ip,
+                request_body: effective_request_body,
+                original_request_body: req_body_snapshot,
+                api_key: auth_key.map(|k| k.key),
+            },
+        );
+    }
 
     let log = ProxyRequestLog {
         id: uuid::Uuid::new_v4().to_string(),
@@ -76,13 +124,18 @@ pub async fn monitor_middleware(
         status,
         duration_ms,
         model: effective_model.clone(),
-        account_id: None, // filled by handler layer if needed
-        upstream_url: response.extensions().get::<UpstreamUrl>().map(|u| u.0.clone()),
+        account_id: effective_account_id.clone(),
+        upstream_url,
         client_ip,
         input_tokens,
         output_tokens,
         error: error_msg,
-        estimated_cost: estimate_cost(&effective_model, input_tokens, output_tokens),
+        estimated_cost: estimate_cost(
+            effective_account_id.as_deref(),
+            &effective_model,
+            input_tokens,
+            output_tokens,
+        ),
         request_body: effective_request_body,
         original_request_body: req_body_snapshot,
         response_body: resp_body_snapshot,
@@ -95,6 +148,103 @@ pub async fn monitor_middleware(
     monitor.add_log(log);
 
     response
+}
+
+fn is_sse_response(response: &Response) -> bool {
+    response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|value| value.contains("text/event-stream"))
+        .unwrap_or(false)
+}
+
+fn wrap_sse_response(
+    monitor: Arc<ProxyMonitor>,
+    response: Response,
+    context: StreamLogContext,
+) -> Response {
+    let (parts, body) = response.into_parts();
+    let mut stream = body.into_data_stream();
+
+    let forwarded = async_stream::stream! {
+        let mut preview = BytesMut::new();
+        let mut pending = Vec::new();
+        let mut input_tokens = None;
+        let mut output_tokens = None;
+        let mut error_msg = None;
+
+        while let Some(chunk_result) = stream.next().await {
+            match &chunk_result {
+                Ok(chunk) => {
+                    let remaining = BODY_TRUNCATE_BYTES.saturating_sub(preview.len());
+                    if remaining > 0 {
+                        preview.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                    }
+                    parse_sse_usage_incremental(
+                        &mut pending,
+                        chunk,
+                        &mut input_tokens,
+                        &mut output_tokens,
+                        &mut error_msg,
+                    );
+                }
+                Err(error) => {
+                    if error_msg.is_none() {
+                        error_msg = Some(error.to_string());
+                    }
+                }
+            }
+
+            yield chunk_result;
+        }
+
+        if !pending.is_empty() {
+            parse_sse_usage_line(
+                &pending,
+                &mut input_tokens,
+                &mut output_tokens,
+                &mut error_msg,
+            );
+        }
+
+        let response_body = if preview.is_empty() {
+            None
+        } else {
+            Some(String::from_utf8_lossy(&preview).into_owned())
+        };
+
+        let log = ProxyRequestLog {
+            id: context.id,
+            timestamp: context.timestamp,
+            method: context.method,
+            url: context.url,
+            status: context.status,
+            duration_ms: context.duration_ms,
+            model: context.model.clone(),
+            account_id: context.account_id.clone(),
+            upstream_url: context.upstream_url,
+            client_ip: context.client_ip,
+            input_tokens,
+            output_tokens,
+            error: error_msg,
+            estimated_cost: estimate_cost(
+                context.account_id.as_deref(),
+                &context.model,
+                input_tokens,
+                output_tokens,
+            ),
+            request_body: context.request_body,
+            original_request_body: context.original_request_body,
+            response_body,
+            api_key: context.api_key,
+        };
+
+        crate::proxy::proxy_stats::global().record(&log);
+        monitor.add_log(log);
+    };
+
+    Response::from_parts(parts, Body::from_stream(forwarded))
 }
 
 fn extract_client_ip(request: &Request) -> Option<String> {
@@ -156,7 +306,6 @@ async fn extract_usage_from_response(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    // Only parse JSON responses for usage data
     if !content_type.contains("application/json") {
         return (
             None,
@@ -171,8 +320,7 @@ async fn extract_usage_from_response(
         Ok(collected) => {
             let bytes = collected.to_bytes();
 
-            let (input_tokens, output_tokens, error_msg) =
-                parse_usage_and_error(&bytes);
+            let (input_tokens, output_tokens, error_msg) = parse_usage_and_error(&bytes);
 
             let snapshot = truncate_body(&bytes);
 
@@ -195,29 +343,174 @@ fn parse_usage_and_error(bytes: &Bytes) -> (Option<i32>, Option<i32>, Option<Str
         Err(_) => return (None, None, None),
     };
 
-    let input_tokens = value
-        .get("usage")
-        .and_then(|u| u.get("prompt_tokens"))
-        .and_then(|v| v.as_i64())
-        .map(|v| v as i32);
+    parse_usage_and_error_value(&value)
+}
 
-    let output_tokens = value
-        .get("usage")
-        .and_then(|u| u.get("completion_tokens"))
-        .and_then(|v| v.as_i64())
-        .map(|v| v as i32);
+fn parse_usage_from_sse(bytes: &Bytes) -> (Option<i32>, Option<i32>, Option<String>) {
+    let payload = String::from_utf8_lossy(bytes);
+    let mut input_tokens = None;
+    let mut output_tokens = None;
+    let mut error_msg = None;
 
-    let error_msg = value
-        .get("error")
-        .and_then(|e| e.get("message"))
-        .and_then(|m| m.as_str())
-        .map(String::from);
+    for line in payload.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("data:") {
+            continue;
+        }
+
+        let data = trimmed.trim_start_matches("data:").trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        let (next_input, next_output, next_error) = parse_usage_and_error_value(&value);
+        input_tokens = next_input.or(input_tokens);
+        output_tokens = next_output.or(output_tokens);
+        error_msg = next_error.or(error_msg);
+    }
 
     (input_tokens, output_tokens, error_msg)
 }
 
+fn parse_sse_usage_incremental(
+    pending: &mut Vec<u8>,
+    chunk: &Bytes,
+    input_tokens: &mut Option<i32>,
+    output_tokens: &mut Option<i32>,
+    error_msg: &mut Option<String>,
+) {
+    pending.extend_from_slice(chunk);
+
+    while let Some(index) = pending.iter().position(|byte| *byte == b'\n') {
+        let line = pending.drain(..=index).collect::<Vec<_>>();
+        parse_sse_usage_line(&line, input_tokens, output_tokens, error_msg);
+    }
+}
+
+fn parse_sse_usage_line(
+    line: &[u8],
+    input_tokens: &mut Option<i32>,
+    output_tokens: &mut Option<i32>,
+    error_msg: &mut Option<String>,
+) {
+    let trimmed = String::from_utf8_lossy(line);
+    let trimmed = trimmed.trim();
+    if !trimmed.starts_with("data:") {
+        return;
+    }
+
+    let data = trimmed.trim_start_matches("data:").trim();
+    if data.is_empty() || data == "[DONE]" {
+        return;
+    }
+
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+        return;
+    };
+
+    let (next_input, next_output, next_error) = parse_usage_and_error_value(&value);
+    *input_tokens = next_input.or(*input_tokens);
+    *output_tokens = next_output.or(*output_tokens);
+    *error_msg = next_error.or(error_msg.take());
+}
+
+fn parse_usage_and_error_value(
+    value: &serde_json::Value,
+) -> (Option<i32>, Option<i32>, Option<String>) {
+    let prompt_tokens = first_i32(
+        value,
+        &[
+            &["usage", "prompt_tokens"],
+            &["usage", "input_tokens"],
+            &["usage", "prompt_token_count"],
+            &["usage_metadata", "prompt_token_count"],
+            &["usageMetadata", "promptTokenCount"],
+            &["usageMetadata", "promptTokens"],
+        ],
+    );
+
+    let completion_tokens = first_i32(
+        value,
+        &[
+            &["usage", "completion_tokens"],
+            &["usage", "output_tokens"],
+            &["usage", "completion_token_count"],
+            &["usage_metadata", "candidates_token_count"],
+            &["usageMetadata", "candidatesTokenCount"],
+            &["usageMetadata", "completionTokenCount"],
+            &["usageMetadata", "outputTokens"],
+        ],
+    );
+
+    let total_tokens = first_i32(
+        value,
+        &[
+            &["usage", "total_tokens"],
+            &["usage", "total_token_count"],
+            &["usage_metadata", "total_token_count"],
+            &["usageMetadata", "totalTokenCount"],
+            &["usageMetadata", "totalTokens"],
+        ],
+    );
+
+    let input_tokens = prompt_tokens.or_else(|| {
+        total_tokens
+            .zip(completion_tokens)
+            .map(|(total, output)| total.saturating_sub(output))
+    });
+    let output_tokens = completion_tokens.or_else(|| {
+        total_tokens
+            .zip(prompt_tokens)
+            .map(|(total, input)| total.saturating_sub(input))
+    });
+
+    let error_msg = first_string(
+        value,
+        &[
+            &["error", "message"],
+            &["error", "details"],
+            &["message"],
+        ],
+    );
+
+    (input_tokens, output_tokens, error_msg)
+}
+
+fn first_i32(value: &serde_json::Value, paths: &[&[&str]]) -> Option<i32> {
+    paths.iter().find_map(|path| value_at_path(value, path).and_then(value_as_i32))
+}
+
+fn first_string(value: &serde_json::Value, paths: &[&[&str]]) -> Option<String> {
+    paths
+        .iter()
+        .find_map(|path| value_at_path(value, path).and_then(|item| item.as_str()).map(String::from))
+}
+
+fn value_at_path<'a>(
+    value: &'a serde_json::Value,
+    path: &[&str],
+) -> Option<&'a serde_json::Value> {
+    let mut current = value;
+    for segment in path {
+        current = current.get(*segment)?;
+    }
+    Some(current)
+}
+
+fn value_as_i32(value: &serde_json::Value) -> Option<i32> {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|v| i64::try_from(v).ok()))
+        .or_else(|| value.as_str().and_then(|v| v.parse::<i64>().ok()))
+        .map(|v| v as i32)
+}
+
 /// Estimate cost using the global price cache.
 fn estimate_cost(
+    account_id: Option<&str>,
     model: &Option<String>,
     input_tokens: Option<i32>,
     output_tokens: Option<i32>,
@@ -225,6 +518,13 @@ fn estimate_cost(
     let model_name = model.as_deref()?;
     let input = input_tokens.unwrap_or(0);
     let output = output_tokens.unwrap_or(0);
+    if let Some(account_id) = account_id {
+        if let Some(cost) = crate::proxy::site_price_cache::global()
+            .estimate_cost(account_id, model_name, input, output)
+        {
+            return Some(cost);
+        }
+    }
     if input == 0 && output == 0 {
         return None;
     }
@@ -240,4 +540,45 @@ fn truncate_body(bytes: &Bytes) -> String {
         bytes.as_ref()
     };
     String::from_utf8_lossy(slice).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_usage_supports_gemini_usage_metadata() {
+        let bytes = Bytes::from_static(
+            br#"{"usageMetadata":{"promptTokenCount":120,"candidatesTokenCount":30,"totalTokenCount":150}}"#,
+        );
+
+        let (input, output, error) = parse_usage_and_error(&bytes);
+        assert_eq!(input, Some(120));
+        assert_eq!(output, Some(30));
+        assert_eq!(error, None);
+    }
+
+    #[test]
+    fn parse_usage_supports_anthropic_stream_events() {
+        let bytes = Bytes::from_static(
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":45,\"output_tokens\":18}}\n\ndata: [DONE]\n",
+        );
+
+        let (input, output, error) = parse_usage_from_sse(&bytes);
+        assert_eq!(input, Some(45));
+        assert_eq!(output, Some(18));
+        assert_eq!(error, None);
+    }
+
+    #[test]
+    fn parse_usage_supports_openai_stream_usage_chunk() {
+        let bytes = Bytes::from_static(
+            b"data: {\"usage\":{\"prompt_tokens\":64,\"completion_tokens\":16}}\n\ndata: [DONE]\n",
+        );
+
+        let (input, output, error) = parse_usage_from_sse(&bytes);
+        assert_eq!(input, Some(64));
+        assert_eq!(output, Some(16));
+        assert_eq!(error, None);
+    }
 }
