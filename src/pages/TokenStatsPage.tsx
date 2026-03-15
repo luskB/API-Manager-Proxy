@@ -274,12 +274,12 @@ export default function TokenStatsPage() {
                     const inputHeight = totalHeight * inputRatio;
                     const outputHeight = totalHeight - inputHeight;
                     return (
-                      <div key={bucket.timestamp} className="flex min-w-[3rem] flex-1 flex-col items-center">
+                      <div key={bucket.timestamp} className="flex h-full min-w-[3rem] flex-1 flex-col items-center">
                         <div
-                          className="tooltip tooltip-top flex h-28 w-full items-end"
+                          className="tooltip tooltip-top flex w-full flex-1 items-end"
                           data-tip={`${formatTokenCount(bucket.input_tokens)} in / ${formatTokenCount(bucket.output_tokens)} out · $${formatUsd(bucket.total_cost)}`}
                         >
-                          <div className="flex w-full flex-col justify-end rounded-t border border-base-300/70 bg-base-200/40 overflow-hidden">
+                          <div className="flex h-full w-full flex-col justify-end overflow-hidden rounded-t border border-base-300/70 bg-base-200/40">
                             <div
                               className="w-full bg-primary/70"
                               style={{ height: `${Math.max(inputHeight, bucket.input_tokens > 0 ? 2 : 0)}%` }}

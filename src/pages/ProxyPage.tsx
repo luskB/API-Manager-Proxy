@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { request } from "../utils/request";
 import type { AppConfig } from "../types/backup";
 import {
+  ArrowDownUp,
   Check,
   Copy,
   DollarSign,
@@ -55,6 +56,8 @@ interface ProxyKeyEditor {
   allowed_models: string[];
   created_at: number;
 }
+
+type ModelPriceSort = "default" | "asc" | "desc";
 
 function newKeyValue(): string {
   return `sk-${crypto.randomUUID().replace(/-/g, "").slice(0, 32)}`;
@@ -112,6 +115,26 @@ function formatRange(
   return `${formatter(min)}-${formatter(max)}`;
 }
 
+function modelPriceSortValue(price?: ProxyModelPriceQuote): number | null {
+  if (!price) return null;
+
+  if (price.billing_mode === "requests") {
+    return price.request_price ?? price.request_price_max ?? null;
+  }
+
+  const input = price.input_per_million ?? price.input_per_million_max ?? null;
+  const output =
+    price.output_per_million ??
+    price.output_per_million_max ??
+    input;
+
+  if (input == null && output == null) {
+    return price.request_price ?? price.request_price_max ?? null;
+  }
+
+  return (input ?? 0) + (output ?? 0);
+}
+
 export default function ProxyPage() {
   const { config, setConfig, error, setError } = useConfig();
   const [status, setStatus] = useState<ProxyStatus>({ running: false });
@@ -127,6 +150,7 @@ export default function ProxyPage() {
   const [editorBusy, setEditorBusy] = useState(false);
   const [modelSearchInput, setModelSearchInput] = useState("");
   const [modelSearch, setModelSearch] = useState("");
+  const [priceSort, setPriceSort] = useState<ModelPriceSort>("default");
   const { t, locale } = useLocale();
 
   const text = (zh: string, en: string) => (locale === "zh" ? zh : en);
@@ -246,11 +270,33 @@ export default function ProxyPage() {
 
   const visibleModels = useMemo(() => {
     const keyword = modelSearch.trim().toLowerCase();
-    if (!keyword) {
-      return availableModels;
+    const filteredModels = keyword
+      ? availableModels.filter((model) => model.toLowerCase().includes(keyword))
+      : [...availableModels];
+
+    if (priceSort === "default") {
+      return filteredModels;
     }
-    return availableModels.filter((model) => model.toLowerCase().includes(keyword));
-  }, [availableModels, modelSearch]);
+
+    return [...filteredModels].sort((left, right) => {
+      const leftValue = modelPriceSortValue(modelPrices[left]);
+      const rightValue = modelPriceSortValue(modelPrices[right]);
+      const leftHasPrice = leftValue != null;
+      const rightHasPrice = rightValue != null;
+
+      if (!leftHasPrice && !rightHasPrice) {
+        return left.localeCompare(right);
+      }
+      if (!leftHasPrice) return 1;
+      if (!rightHasPrice) return -1;
+
+      if (leftValue !== rightValue) {
+        return priceSort === "asc" ? leftValue! - rightValue! : rightValue! - leftValue!;
+      }
+
+      return left.localeCompare(right);
+    });
+  }, [availableModels, modelPrices, modelSearch, priceSort]);
 
   async function persistConfig(nextConfig: AppConfig) {
     await request("save_config", { config_data: nextConfig });
@@ -300,6 +346,7 @@ export default function ProxyPage() {
     setEditor(defaultEditor());
     setModelSearchInput("");
     setModelSearch("");
+    setPriceSort("default");
     setEditorOpen(true);
   }
 
@@ -319,6 +366,7 @@ export default function ProxyPage() {
     });
     setModelSearchInput("");
     setModelSearch("");
+    setPriceSort("default");
     setEditorOpen(true);
   }
 
@@ -329,6 +377,7 @@ export default function ProxyPage() {
     setEditor(defaultEditor());
     setModelSearchInput("");
     setModelSearch("");
+    setPriceSort("default");
   }
 
   function toggleSite(accountId: string) {
@@ -951,6 +1000,18 @@ curl http://127.0.0.1:${config.proxy.port}/health`}
                         </button>
                       )}
                     </div>
+                    <label className="input input-bordered input-sm flex items-center gap-2">
+                      <ArrowDownUp size={14} className="text-base-content/50" />
+                      <select
+                        className="bg-transparent outline-none"
+                        value={priceSort}
+                        onChange={(e) => setPriceSort(e.target.value as ModelPriceSort)}
+                      >
+                        <option value="default">{text("默认排序", "Default order")}</option>
+                        <option value="asc">{text("价格升序", "Price low-high")}</option>
+                        <option value="desc">{text("价格降序", "Price high-low")}</option>
+                      </select>
+                    </label>
                     <button
                       className="btn btn-outline btn-xs"
                       onClick={() => setEditor((prev) => ({ ...prev, allowed_models: availableModels }))}
@@ -994,16 +1055,18 @@ curl http://127.0.0.1:${config.proxy.port}/health`}
                             checked={editor.allowed_models.includes(model)}
                             onChange={() => toggleModel(model)}
                           />
-                          <span className="truncate">{model}</span>
+                          <span className="truncate" title={model}>
+                            {model}
+                          </span>
                         </span>
                         <button
-                          className="btn btn-ghost btn-xs tooltip tooltip-left"
-                          data-tip={priceTooltip(model)}
+                          className="btn btn-ghost btn-xs"
                           type="button"
                           onClick={(e) => {
                             e.preventDefault();
                             e.stopPropagation();
                           }}
+                          title={priceTooltip(model)}
                           aria-label={priceTooltip(model)}
                         >
                           <DollarSign

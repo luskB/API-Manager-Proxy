@@ -296,7 +296,7 @@ export default function Dashboard() {
               <TrendingUp size={16} />
               {text("Request Trend", "Request Trend")}
             </h2>
-            <div className="flex items-end gap-1 h-32 mt-2">
+            <div className="mt-2 flex h-32 items-end gap-1">
               {(() => {
                 const maxReqs = Math.max(...stats.timeline.map((bucket) => bucket.total_requests), 1);
                 return stats.timeline.map((bucket) => {
@@ -307,9 +307,9 @@ export default function Dashboard() {
                   const barColor =
                     successPct >= 90 ? "bg-success" : successPct >= 50 ? "bg-warning" : "bg-error";
                   return (
-                    <div key={bucket.timestamp} className="flex flex-col items-center flex-1 min-w-0">
+                    <div key={bucket.timestamp} className="flex h-full min-w-0 flex-1 flex-col items-center">
                       <div
-                        className="tooltip tooltip-top w-full"
+                        className="tooltip tooltip-top flex w-full flex-1 items-end"
                         data-tip={`${bucket.total_requests} reqs, $${bucket.total_cost.toFixed(4)}`}
                       >
                         <div
