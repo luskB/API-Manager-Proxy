@@ -342,7 +342,7 @@ export default function CliSyncCard({
       appType: app,
       proxyUrl: getFormattedProxyUrl(app),
       apiKey,
-      model: defaultModel,
+      model: app === "OpenCode" ? null : defaultModel,
       models: effectiveModels,
       claudeModels: app === "Claude" ? getClaudeModels(effectiveModels) : null,
       ...(fileName ? { fileName } : {}),
@@ -679,11 +679,6 @@ export default function CliSyncCard({
                   "No models are selected, so syncing only writes the endpoint and API key.",
                 )}
               </span>
-            )}
-            {defaultModel && (
-              <div className="mt-1 font-mono text-[11px] text-base-content/55 truncate max-w-[18rem]">
-                {text("默认模型", "Default")}: {defaultModel}
-              </div>
             )}
           </div>
         </div>

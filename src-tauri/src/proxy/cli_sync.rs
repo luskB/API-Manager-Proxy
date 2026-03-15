@@ -320,6 +320,26 @@ fn ensure_string_in_array(root: &mut Map<String, Value>, key: &str, target: &str
     }
 }
 
+fn write_json_atomically(file: &CliConfigFile, json: &Value) -> Result<(), String> {
+    if let Some(parent) = file.path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("Cannot create directory: {}", e))?;
+    }
+
+    let backup_path = primary_backup_path(&file.path, &file.name);
+    if file.path.exists() && !backup_path.exists() {
+        if let Err(error) = fs::copy(&file.path, &backup_path) {
+            tracing::warn!("Failed to create backup for {}: {}", file.name, error);
+        }
+    }
+
+    let output = serde_json::to_string_pretty(json).unwrap();
+    let tmp_path = file.path.with_extension("tmp");
+    fs::write(&tmp_path, &output).map_err(|e| format!("Failed to write temp file: {}", e))?;
+    fs::rename(&tmp_path, &file.path)
+        .map_err(|e| format!("Failed to rename config file: {}", e))?;
+    Ok(())
+}
+
 fn apply_opencode_config(
     json: &mut Value,
     proxy_url: &str,
@@ -393,19 +413,9 @@ fn apply_opencode_config(
         }
     }
 
-    if let Some(model) = default_model.filter(|value| !value.trim().is_empty()) {
-        root.insert(
-            "model".to_string(),
-            Value::String(format!("{API_MANAGER_PROXY_PROVIDER_KEY}/{model}")),
-        );
-        root.insert(
-            "small_model".to_string(),
-            Value::String(format!("{API_MANAGER_PROXY_PROVIDER_KEY}/{model}")),
-        );
-    } else {
-        root.remove("model");
-        root.remove("small_model");
-    }
+    let _ = default_model;
+    root.remove("model");
+    root.remove("small_model");
 }
 
 fn sync_opencode_legacy_file(
@@ -422,21 +432,6 @@ fn sync_opencode_legacy_file(
         return Ok(());
     }
 
-    if let Some(parent) = file.path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("Cannot create directory: {}", e))?;
-    }
-
-    let backup_path = primary_backup_path(&file.path, &file.name);
-    if !backup_path.exists() {
-        if let Err(error) = fs::copy(&file.path, &backup_path) {
-            tracing::warn!(
-                "Failed to create legacy OpenCode backup for {}: {}",
-                file.name,
-                error
-            );
-        }
-    }
-
     let content = if file.path.exists() {
         fs::read_to_string(&file.path).unwrap_or_default()
     } else {
@@ -445,11 +440,7 @@ fn sync_opencode_legacy_file(
     let mut json: Value =
         serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}));
     apply_opencode_config(&mut json, proxy_url, api_key, models, default_model);
-    let output = serde_json::to_string_pretty(&json).unwrap();
-    let tmp_path = file.path.with_extension("tmp");
-    fs::write(&tmp_path, &output).map_err(|e| format!("Failed to write temp file: {}", e))?;
-    fs::rename(&tmp_path, &file.path)
-        .map_err(|e| format!("Failed to rename config file: {}", e))?;
+    write_json_atomically(&file, &json)?;
     Ok(())
 }
 
@@ -1385,10 +1376,8 @@ mod tests {
                 .and_then(Value::as_str),
             Some("gpt-5.2")
         );
-        assert_eq!(
-            json.get("model").and_then(Value::as_str),
-            Some("apimanagerproxy/gpt-5.2")
-        );
+        assert!(json.get("model").is_none());
+        assert!(json.get("small_model").is_none());
     }
 
     #[test]
@@ -1403,4 +1392,5 @@ mod tests {
         assert!(normalized.ends_with("/.config/opencode/opencode.json"));
         assert_eq!(file.name, "opencode.json");
     }
+
 }
