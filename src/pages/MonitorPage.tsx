@@ -5,6 +5,8 @@ import { cn } from "../utils/cn";
 import { useConfig } from "../hooks/useConfig";
 import { useLocale } from "../hooks/useLocale";
 
+let monitorAutoRefreshEnabled = false;
+
 interface ProxyRequestLog {
   id: string;
   timestamp: number;
@@ -33,7 +35,7 @@ interface LogsResponse {
 export default function MonitorPage() {
   const [logs, setLogs] = useState<ProxyRequestLog[]>([]);
   const [total, setTotal] = useState(0);
-  const [autoRefresh, setAutoRefresh] = useState(false);
+  const [autoRefresh, setAutoRefresh] = useState(() => monitorAutoRefreshEnabled);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [replayResult, setReplayResult] = useState<{ status: number; body: string } | null>(null);
   const [replaying, setReplaying] = useState(false);
@@ -44,6 +46,10 @@ export default function MonitorPage() {
   useEffect(() => {
     loadLogs();
   }, []);
+
+  useEffect(() => {
+    monitorAutoRefreshEnabled = autoRefresh;
+  }, [autoRefresh]);
 
   useEffect(() => {
     if (!autoRefresh) return;

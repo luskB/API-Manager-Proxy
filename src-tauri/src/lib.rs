@@ -136,6 +136,7 @@ pub fn run() {
             commands::validate_api_key,
             commands::list_hub_accounts,
             commands::refresh_hub_balances,
+            commands::refresh_selected_hub_balances,
             commands::detect_hub_account,
             commands::detect_all_hub_accounts,
             commands::hub_checkin_account,

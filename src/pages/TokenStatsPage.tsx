@@ -340,12 +340,17 @@ export default function TokenStatsPage() {
     return rows;
   }, [featuredModels, scope, stats]);
 
+  const displayDistributionBuckets = useMemo(
+    () => [...distributionBuckets].reverse(),
+    [distributionBuckets],
+  );
+
   const maxDistributionValue = useMemo(() => {
-    const values = distributionBuckets.map((bucket) =>
+    const values = displayDistributionBuckets.map((bucket) =>
       distributionMetric === "cost" ? bucket.total_cost : bucket.total_tokens,
     );
     return Math.max(...values, 1);
-  }, [distributionBuckets, distributionMetric]);
+  }, [displayDistributionBuckets, distributionMetric]);
 
   const modelRankingRows = useMemo(() => {
     return featuredModels.length > 0
@@ -367,6 +372,11 @@ export default function TokenStatsPage() {
   const maxAccountCost = useMemo(
     () => Math.max(...accountRows.map(([, row]) => row.total_estimated_cost), 1),
     [accountRows],
+  );
+
+  const recentTimelineRows = useMemo(
+    () => [...(stats?.timeline ?? [])].reverse().slice(0, 3),
+    [stats?.timeline],
   );
 
   function scopeHint(): string {
@@ -542,7 +552,7 @@ export default function TokenStatsPage() {
               </div>
             </div>
 
-            {distributionBuckets.length === 0 || modelRankingRows.length === 0 ? (
+            {displayDistributionBuckets.length === 0 || modelRankingRows.length === 0 ? (
               <div className="mt-6 rounded-2xl border border-dashed border-base-300 px-4 py-10 text-center text-sm text-base-content/55">
                 {text("暂时还没有可展示的 Token 分布数据。", "No token distribution data yet.")}
               </div>
@@ -571,7 +581,7 @@ export default function TokenStatsPage() {
                     </div>
 
                     <div className="relative flex h-72 items-end gap-2 overflow-x-auto px-1 pb-6 pt-3">
-                      {distributionBuckets.map((bucket) => {
+                      {displayDistributionBuckets.map((bucket) => {
                         const totalValue =
                           distributionMetric === "cost" ? bucket.total_cost : bucket.total_tokens;
                         const barHeight = totalValue > 0
@@ -804,9 +814,9 @@ export default function TokenStatsPage() {
               <BarChart3 size={18} className="text-base-content/35" />
             </div>
 
-            {stats?.timeline.length ? (
+            {recentTimelineRows.length ? (
               <div className="mt-5 grid grid-cols-1 gap-3 md:grid-cols-3">
-                {stats.timeline.slice(-3).map((bucket) => (
+                {recentTimelineRows.map((bucket) => (
                   <div
                     key={bucket.timestamp}
                     className="rounded-2xl border border-base-300/80 bg-base-100 px-4 py-4 shadow-sm"

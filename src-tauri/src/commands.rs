@@ -1153,6 +1153,80 @@ pub async fn refresh_hub_balances() -> Result<HubBalanceRefreshResponse, String>
 }
 
 #[tauri::command(rename_all = "snake_case")]
+pub async fn refresh_selected_hub_balances(
+    account_ids: Vec<String>,
+) -> Result<HubBalanceRefreshResponse, String> {
+    let mut cfg = config::load_app_config();
+    if cfg.accounts.is_empty() || account_ids.is_empty() {
+        return Ok(HubBalanceRefreshResponse {
+            accounts: cfg.accounts,
+            refreshed: 0,
+            failed: 0,
+        });
+    }
+
+    let requested_ids: std::collections::HashSet<String> = account_ids.into_iter().collect();
+    let client = hub_http_client(cfg.proxy.request_timeout)?;
+    let accounts: Vec<SiteAccount> = cfg
+        .accounts
+        .iter()
+        .filter(|account| requested_ids.contains(&account.id))
+        .cloned()
+        .collect();
+
+    let mut handles = Vec::with_capacity(accounts.len());
+    for account in accounts {
+        let client = client.clone();
+        handles.push(tokio::spawn(async move {
+            let result = hub_service::fetch_balance_overview(&client, &account).await;
+            (account.id, result)
+        }));
+    }
+
+    let timestamp_ms = now_millis();
+    let mut refreshed = 0usize;
+    let mut failed = 0usize;
+
+    for handle in handles {
+        let (account_id, result) = handle
+            .await
+            .map_err(|e| format!("Refresh balance task failed: {}", e))?;
+
+        match result {
+            Ok(snapshot) => {
+                refreshed += 1;
+                for account in &mut cfg.accounts {
+                    if account.id == account_id {
+                        apply_balance_snapshot_to_account(account, &snapshot, timestamp_ms);
+                    }
+                }
+                for account in &mut cfg.proxy_accounts {
+                    if account.id == account_id {
+                        apply_balance_snapshot_to_account(account, &snapshot, timestamp_ms);
+                    }
+                }
+            }
+            Err(error) => {
+                failed += 1;
+                tracing::warn!(
+                    account_id = %account_id,
+                    error = %error,
+                    "Failed to refresh selected hub balance snapshot"
+                );
+            }
+        }
+    }
+
+    config::save_app_config(&cfg)?;
+
+    Ok(HubBalanceRefreshResponse {
+        accounts: cfg.accounts,
+        refreshed,
+        failed,
+    })
+}
+
+#[tauri::command(rename_all = "snake_case")]
 pub async fn detect_hub_account(
     account_id: String,
     include_details: Option<bool>,

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::constants::{CLI_BACKUP_SUFFIX, LEGACY_CLI_BACKUP_SUFFIX};
@@ -14,6 +14,7 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const API_MANAGER_PROXY_PROVIDER_KEY: &str = "apimanagerproxy";
 const API_MANAGER_PROXY_PROVIDER_NAME: &str = "APIManagerProxy";
+const OPENCODE_SCHEMA_URL: &str = "https://opencode.ai/config.json";
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub enum CliApp {
@@ -93,8 +94,8 @@ impl CliApp {
                 },
             ],
             CliApp::OpenCode => vec![CliConfigFile {
-                name: "config.json".to_string(),
-                path: home.join(".opencode").join("config.json"),
+                name: "opencode.json".to_string(),
+                path: opencode_config_path(&home),
             }],
             CliApp::Droid => vec![CliConfigFile {
                 name: "settings.json".to_string(),
@@ -121,6 +122,17 @@ impl CliApp {
             CliApp::Droid => "https://api.anthropic.com",
         }
     }
+}
+
+fn opencode_config_path(home: &Path) -> PathBuf {
+    home.join(".config").join("opencode").join("opencode.json")
+}
+
+fn opencode_legacy_config_file() -> Option<CliConfigFile> {
+    dirs::home_dir().map(|home| CliConfigFile {
+        name: "config.json".to_string(),
+        path: home.join(".opencode").join("config.json"),
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -275,16 +287,37 @@ fn default_model<'a>(models: &'a [String], model: Option<&'a str>) -> Option<&'a
 fn opencode_provider_models(models: &[String], default_model: Option<&str>) -> Map<String, Value> {
     let mut provider_models = Map::new();
     for model in models {
-        provider_models.insert(model.clone(), serde_json::json!({}));
+        provider_models.insert(model.clone(), serde_json::json!({ "name": model }));
     }
 
     if provider_models.is_empty() {
         if let Some(model) = default_model.filter(|value| !value.trim().is_empty()) {
-            provider_models.insert(model.to_string(), serde_json::json!({}));
+            provider_models.insert(model.to_string(), serde_json::json!({ "name": model }));
         }
     }
 
     provider_models
+}
+
+fn remove_from_string_array(root: &mut Map<String, Value>, key: &str, target: &str) {
+    if let Some(items) = root.get_mut(key).and_then(Value::as_array_mut) {
+        items.retain(|value| value.as_str() != Some(target));
+    }
+}
+
+fn ensure_string_in_array(root: &mut Map<String, Value>, key: &str, target: &str) {
+    let entry = root
+        .entry(key.to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if entry.as_array().is_none() {
+        *entry = Value::Array(Vec::new());
+    }
+
+    if let Some(items) = entry.as_array_mut() {
+        if !items.iter().any(|value| value.as_str() == Some(target)) {
+            items.push(Value::String(target.to_string()));
+        }
+    }
 }
 
 fn apply_opencode_config(
@@ -300,57 +333,13 @@ fn apply_opencode_config(
 
     let root = json.as_object_mut().expect("root object already created");
     let provider_models = opencode_provider_models(models, default_model);
-
-    let providers = root
-        .entry("providers")
-        .or_insert_with(|| serde_json::json!({}));
-    if providers.as_object().is_none() {
-        *providers = serde_json::json!({});
-    }
-
-    if let Some(providers_obj) = providers.as_object_mut() {
-        for provider_key in [API_MANAGER_PROXY_PROVIDER_KEY, "openai"] {
-            let provider = providers_obj
-                .entry(provider_key.to_string())
-                .or_insert_with(|| serde_json::json!({}));
-            if provider.as_object().is_none() {
-                *provider = serde_json::json!({});
-            }
-            if let Some(provider_obj) = provider.as_object_mut() {
-                provider_obj.insert(
-                    "name".to_string(),
-                    Value::String(API_MANAGER_PROXY_PROVIDER_NAME.to_string()),
-                );
-                provider_obj.insert(
-                    "displayName".to_string(),
-                    Value::String(API_MANAGER_PROXY_PROVIDER_NAME.to_string()),
-                );
-                provider_obj.insert(
-                    "baseURL".to_string(),
-                    Value::String(proxy_url.to_string()),
-                );
-                provider_obj.insert(
-                    "baseUrl".to_string(),
-                    Value::String(proxy_url.to_string()),
-                );
-                if !api_key.is_empty() {
-                    provider_obj.insert(
-                        "apiKey".to_string(),
-                        Value::String(api_key.to_string()),
-                    );
-                }
-                provider_obj.insert(
-                    "models".to_string(),
-                    Value::Array(models.iter().cloned().map(Value::String).collect()),
-                );
-                if let Some(model) = default_model {
-                    provider_obj.insert(
-                        "defaultModel".to_string(),
-                        Value::String(model.to_string()),
-                    );
-                }
-            }
-        }
+    root.insert(
+        "$schema".to_string(),
+        Value::String(OPENCODE_SCHEMA_URL.to_string()),
+    );
+    remove_from_string_array(root, "disabled_providers", API_MANAGER_PROXY_PROVIDER_KEY);
+    if root.contains_key("enabled_providers") {
+        ensure_string_in_array(root, "enabled_providers", API_MANAGER_PROXY_PROVIDER_KEY);
     }
 
     let provider = root
@@ -371,6 +360,10 @@ fn apply_opencode_config(
                 "name".to_string(),
                 Value::String(API_MANAGER_PROXY_PROVIDER_NAME.to_string()),
             );
+            custom_provider_obj.insert(
+                "npm".to_string(),
+                Value::String("@ai-sdk/openai-compatible".to_string()),
+            );
             let options = custom_provider_obj
                 .entry("options")
                 .or_insert_with(|| serde_json::json!({}));
@@ -382,20 +375,16 @@ fn apply_opencode_config(
                     "baseURL".to_string(),
                     Value::String(proxy_url.to_string()),
                 );
-                options_obj.insert(
-                    "baseUrl".to_string(),
-                    Value::String(proxy_url.to_string()),
-                );
+                options_obj.remove("baseUrl");
                 if !api_key.is_empty() {
                     options_obj.insert(
                         "apiKey".to_string(),
                         Value::String(api_key.to_string()),
                     );
-                    options_obj.insert(
-                        "api_key".to_string(),
-                        Value::String(api_key.to_string()),
-                    );
+                } else {
+                    options_obj.remove("apiKey");
                 }
+                options_obj.remove("api_key");
             }
             custom_provider_obj.insert(
                 "models".to_string(),
@@ -417,6 +406,82 @@ fn apply_opencode_config(
         root.remove("model");
         root.remove("small_model");
     }
+}
+
+fn sync_opencode_legacy_file(
+    proxy_url: &str,
+    api_key: &str,
+    default_model: Option<&str>,
+    models: &[String],
+) -> Result<(), String> {
+    let Some(file) = opencode_legacy_config_file() else {
+        return Ok(());
+    };
+
+    if !file.path.exists() {
+        return Ok(());
+    }
+
+    if let Some(parent) = file.path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("Cannot create directory: {}", e))?;
+    }
+
+    let backup_path = primary_backup_path(&file.path, &file.name);
+    if !backup_path.exists() {
+        if let Err(error) = fs::copy(&file.path, &backup_path) {
+            tracing::warn!(
+                "Failed to create legacy OpenCode backup for {}: {}",
+                file.name,
+                error
+            );
+        }
+    }
+
+    let content = if file.path.exists() {
+        fs::read_to_string(&file.path).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let mut json: Value =
+        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}));
+    apply_opencode_config(&mut json, proxy_url, api_key, models, default_model);
+    let output = serde_json::to_string_pretty(&json).unwrap();
+    let tmp_path = file.path.with_extension("tmp");
+    fs::write(&tmp_path, &output).map_err(|e| format!("Failed to write temp file: {}", e))?;
+    fs::rename(&tmp_path, &file.path)
+        .map_err(|e| format!("Failed to rename config file: {}", e))?;
+    Ok(())
+}
+
+fn write_opencode_legacy_content(content: &str) -> Result<(), String> {
+    let Some(file) = opencode_legacy_config_file() else {
+        return Ok(());
+    };
+
+    if !file.path.exists() {
+        return Ok(());
+    }
+
+    if let Some(parent) = file.path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("Cannot create directory: {}", e))?;
+    }
+
+    let backup_path = primary_backup_path(&file.path, &file.name);
+    if !backup_path.exists() {
+        if let Err(error) = fs::copy(&file.path, &backup_path) {
+            tracing::warn!(
+                "Failed to create legacy OpenCode backup for {}: {}",
+                file.name,
+                error
+            );
+        }
+    }
+
+    let tmp_path = file.path.with_extension("tmp");
+    fs::write(&tmp_path, content).map_err(|e| format!("Failed to write temp file: {}", e))?;
+    fs::rename(&tmp_path, &file.path)
+        .map_err(|e| format!("Failed to rename config file: {}", e))?;
+    Ok(())
 }
 
 fn opencode_base_url(json: &Value) -> Option<String> {
@@ -534,7 +599,7 @@ pub fn get_sync_status(app: &CliApp, proxy_url: &str) -> (bool, bool, Option<Str
                 }
             }
             CliApp::OpenCode => {
-                if file.name == "config.json" {
+                if file.name == "opencode.json" || file.name == "config.json" {
                     let json: Value = serde_json::from_str(&content).unwrap_or_default();
                     if let Some(u) = opencode_base_url(&json) {
                         current_base_url = Some(u.to_string());
@@ -633,6 +698,10 @@ pub fn sync_config(
             .map_err(|e| format!("Failed to write temp file: {}", e))?;
         fs::rename(&tmp_path, &file.path)
             .map_err(|e| format!("Failed to rename config file: {}", e))?;
+    }
+
+    if app == &CliApp::OpenCode {
+        sync_opencode_legacy_file(proxy_url, api_key, default_model(models, model), models)?;
     }
 
     Ok(())
@@ -878,7 +947,7 @@ pub fn generate_config_content(
             serde_json::to_string_pretty(&json).unwrap()
         }
         CliApp::Gemini => content,
-        CliApp::OpenCode if file_name == "config.json" => {
+        CliApp::OpenCode if file_name == "opencode.json" || file_name == "config.json" => {
             let mut json: Value =
                 serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}));
             apply_opencode_config(&mut json, proxy_url, api_key, models, default_model);
@@ -992,6 +1061,17 @@ pub async fn execute_cli_restore(app_type: CliApp) -> Result<(), String> {
         }
     }
 
+    if app_type == CliApp::OpenCode {
+        if let Some(file) = opencode_legacy_config_file() {
+            if let Some(backup_path) = existing_backup_path(&file.path, &file.name) {
+                if let Err(e) = fs::rename(&backup_path, &file.path) {
+                    return Err(format!("Restore backup failed {}: {}", file.name, e));
+                }
+                restored_count += 1;
+            }
+        }
+    }
+
     if restored_count > 0 {
         return Ok(());
     }
@@ -1090,6 +1170,11 @@ pub async fn write_cli_config(
         .map_err(|e| format!("Failed to write temp file: {}", e))?;
     fs::rename(&tmp_path, &file.path)
         .map_err(|e| format!("Failed to rename config file: {}", e))?;
+
+    if app_type == CliApp::OpenCode && (file_name == "opencode.json" || file_name == "config.json")
+    {
+        write_opencode_legacy_content(&content)?;
+    }
 
     Ok(())
 }
@@ -1233,4 +1318,89 @@ pub async fn probe_cli_compatibility(
     api_key: String,
 ) -> Result<CliProbeResult, String> {
     Ok(probe_cli(&app_type, proxy_port, &api_key).await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_opencode_config_matches_current_provider_schema() {
+        let mut json = serde_json::json!({
+            "disabled_providers": ["apimanagerproxy", "other"],
+            "enabled_providers": ["other"],
+            "provider": {}
+        });
+
+        let models = vec!["gpt-5.2".to_string(), "claude-opus-4-6".to_string()];
+        apply_opencode_config(
+            &mut json,
+            "http://127.0.0.1:7888/v1",
+            "sk-test",
+            &models,
+            Some("gpt-5.2"),
+        );
+
+        assert_eq!(
+            json.get("$schema").and_then(Value::as_str),
+            Some(OPENCODE_SCHEMA_URL)
+        );
+
+        let disabled = json
+            .get("disabled_providers")
+            .and_then(Value::as_array)
+            .expect("disabled_providers should stay an array");
+        assert!(!disabled
+            .iter()
+            .any(|value| value.as_str() == Some(API_MANAGER_PROXY_PROVIDER_KEY)));
+
+        let enabled = json
+            .get("enabled_providers")
+            .and_then(Value::as_array)
+            .expect("enabled_providers should stay an array");
+        assert!(enabled
+            .iter()
+            .any(|value| value.as_str() == Some(API_MANAGER_PROXY_PROVIDER_KEY)));
+
+        let provider = json
+            .get("provider")
+            .and_then(|value| value.get(API_MANAGER_PROXY_PROVIDER_KEY))
+            .expect("custom provider should exist");
+        assert_eq!(
+            provider.get("npm").and_then(Value::as_str),
+            Some("@ai-sdk/openai-compatible")
+        );
+        assert_eq!(
+            provider
+                .get("options")
+                .and_then(|value| value.get("baseURL"))
+                .and_then(Value::as_str),
+            Some("http://127.0.0.1:7888/v1")
+        );
+        assert_eq!(
+            provider
+                .get("models")
+                .and_then(|value| value.get("gpt-5.2"))
+                .and_then(|value| value.get("name"))
+                .and_then(Value::as_str),
+            Some("gpt-5.2")
+        );
+        assert_eq!(
+            json.get("model").and_then(Value::as_str),
+            Some("apimanagerproxy/gpt-5.2")
+        );
+    }
+
+    #[test]
+    fn opencode_config_file_uses_current_directory() {
+        let file = CliApp::OpenCode
+            .config_files()
+            .into_iter()
+            .next()
+            .expect("OpenCode should expose one config file");
+
+        let normalized = file.path.to_string_lossy().replace('\\', "/");
+        assert!(normalized.ends_with("/.config/opencode/opencode.json"));
+        assert_eq!(file.name, "opencode.json");
+    }
 }

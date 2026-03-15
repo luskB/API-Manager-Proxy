@@ -231,11 +231,14 @@ export default function HubPage() {
 
   const [accounts, setAccounts] = useState<SiteAccount[]>([]);
   const [detectionMap, setDetectionMap] = useState<Record<string, HubDetectionResult>>({});
+  const [selectedAccountIds, setSelectedAccountIds] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshingBalances, setRefreshingBalances] = useState(false);
+  const [selectedRefreshing, setSelectedRefreshing] = useState(false);
   const [busyAccountId, setBusyAccountId] = useState<string | null>(null);
   const [detectingAll, setDetectingAll] = useState(false);
   const [autoCheckinRunning, setAutoCheckinRunning] = useState(false);
+  const [selectedCheckinRunning, setSelectedCheckinRunning] = useState(false);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [search, setSearch] = useState("");
@@ -294,6 +297,11 @@ export default function HubPage() {
   }, [message]);
 
   useEffect(() => {
+    const validIds = new Set(accounts.map((account) => account.id));
+    setSelectedAccountIds((prev) => prev.filter((id) => validIds.has(id)));
+  }, [accounts]);
+
+  useEffect(() => {
     storageSet(HUB_STORAGE.autoRefreshEnabled, String(autoRefreshEnabled));
   }, [autoRefreshEnabled]);
 
@@ -328,6 +336,15 @@ export default function HubPage() {
       })
       .sort((a, b) => a.site_name.localeCompare(b.site_name));
   }, [accounts, search, typeFilter]);
+
+  const filteredAccountIds = useMemo(
+    () => filteredAccounts.map((account) => account.id),
+    [filteredAccounts],
+  );
+
+  const allFilteredSelected =
+    filteredAccountIds.length > 0 &&
+    filteredAccountIds.every((accountId) => selectedAccountIds.includes(accountId));
 
   function rowStatus(account: SiteAccount): "success" | "failed" | "unknown" {
     const detection = detectionMap[account.id];
@@ -383,6 +400,108 @@ export default function HubPage() {
     } finally {
       refreshInFlightRef.current = false;
       setRefreshingBalances(false);
+    }
+  }
+
+  function toggleSelectedAccount(accountId: string) {
+    setSelectedAccountIds((prev) =>
+      prev.includes(accountId)
+        ? prev.filter((id) => id !== accountId)
+        : [...prev, accountId],
+    );
+  }
+
+  function selectAllFilteredAccounts() {
+    setSelectedAccountIds((prev) => Array.from(new Set([...prev, ...filteredAccountIds])));
+  }
+
+  function clearSelectedAccounts() {
+    setSelectedAccountIds([]);
+  }
+
+  async function refreshSelectedBalances() {
+    if (selectedAccountIds.length === 0) {
+      setMessage(text("请先选择站点", "Select sites first"));
+      return;
+    }
+
+    setSelectedRefreshing(true);
+    setError("");
+    try {
+      const result = await request<HubBalanceRefreshResponse>("refresh_selected_hub_balances", {
+        account_ids: selectedAccountIds,
+      });
+      setAccounts(result.accounts ?? []);
+      setMessage(
+        result.failed > 0
+          ? text(
+              `已刷新 ${result.refreshed} 个选中站点，${result.failed} 个失败`,
+              `Refreshed ${result.refreshed} selected sites, ${result.failed} failed`,
+            )
+          : text(
+              `已刷新 ${result.refreshed} 个选中站点的余额与今日消耗`,
+              `Refreshed balance and daily usage for ${result.refreshed} selected sites`,
+            ),
+      );
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSelectedRefreshing(false);
+    }
+  }
+
+  async function checkinSelectedAccounts() {
+    if (selectedAccountIds.length === 0) {
+      setMessage(text("请先选择站点", "Select sites first"));
+      return;
+    }
+
+    setSelectedCheckinRunning(true);
+    setError("");
+    try {
+      const targets = accounts.filter((account) => selectedAccountIds.includes(account.id));
+      let success = 0;
+      let failed = 0;
+      let unsupported = 0;
+      const detectionUpdates: Record<string, HubDetectionResult> = {};
+
+      for (const account of targets) {
+        const detection = detectionMap[account.id];
+        if (detection && !detection.has_checkin) {
+          unsupported += 1;
+          continue;
+        }
+
+        const response = await request<HubCheckinResponse>("hub_checkin_account", {
+          account_id: account.id,
+        });
+
+        if (response.detection) {
+          detectionUpdates[response.detection.account_id] = response.detection;
+        }
+
+        if (response.checkin.success) {
+          success += 1;
+        } else {
+          failed += 1;
+        }
+      }
+
+      if (Object.keys(detectionUpdates).length > 0) {
+        setDetectionMap((prev) => ({ ...prev, ...detectionUpdates }));
+      }
+
+      await loadAccounts(false);
+      setMessage(
+        text(
+          `选中签到完成：成功 ${success}，失败 ${failed}${unsupported > 0 ? `，不支持 ${unsupported}` : ""}`,
+          `Selected check-in finished: ${success} succeeded, ${failed} failed${unsupported > 0 ? `, ${unsupported} unsupported` : ""}`,
+        ),
+      );
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSelectedCheckinRunning(false);
     }
   }
 
@@ -656,7 +775,7 @@ export default function HubPage() {
           <button
             className="btn btn-outline btn-sm gap-2"
             onClick={() => void refreshBalanceSnapshots(false)}
-            disabled={loading || refreshingBalances}
+            disabled={loading || refreshingBalances || selectedRefreshing || selectedCheckinRunning}
           >
             <RefreshCw size={14} className={loading || refreshingBalances ? "animate-spin" : ""} />
             {t("common.refresh")}
@@ -664,7 +783,7 @@ export default function HubPage() {
           <button
             className="btn btn-outline btn-sm gap-2"
             onClick={detectAll}
-            disabled={detectingAll || autoCheckinRunning || loading || refreshingBalances}
+            disabled={detectingAll || autoCheckinRunning || selectedCheckinRunning || loading || refreshingBalances || selectedRefreshing}
           >
             <ScanSearch size={14} className={detectingAll ? "animate-pulse" : ""} />
             {detectingAll ? t("hub.detecting") : t("hub.detectAll")}
@@ -672,7 +791,7 @@ export default function HubPage() {
           <button
             className="btn btn-success btn-sm gap-2"
             onClick={autoCheckin}
-            disabled={autoCheckinRunning || detectingAll || loading || refreshingBalances}
+            disabled={autoCheckinRunning || selectedCheckinRunning || detectingAll || loading || refreshingBalances || selectedRefreshing}
           >
             <CheckCircle2 size={14} className={autoCheckinRunning ? "animate-pulse" : ""} />
             {autoCheckinRunning ? t("hub.running") : t("hub.autoCheckin")}
@@ -720,6 +839,56 @@ export default function HubPage() {
               ))}
             </select>
           </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="rounded-lg border border-base-300 bg-base-100 px-3 py-2 text-xs text-base-content/65">
+              {text("已选站点", "Selected sites")}: {selectedAccountIds.length}
+            </div>
+            <button
+              className="btn btn-ghost btn-sm"
+              onClick={selectAllFilteredAccounts}
+              disabled={filteredAccountIds.length === 0 || allFilteredSelected}
+            >
+              {text("全选当前结果", "Select all visible")}
+            </button>
+            <button
+              className="btn btn-ghost btn-sm"
+              onClick={clearSelectedAccounts}
+              disabled={selectedAccountIds.length === 0}
+            >
+              {text("清除选中", "Clear selected")}
+            </button>
+            <button
+              className="btn btn-outline btn-sm gap-2"
+              onClick={() => void refreshSelectedBalances()}
+              disabled={
+                selectedAccountIds.length === 0 ||
+                selectedRefreshing ||
+                refreshingBalances ||
+                autoCheckinRunning ||
+                selectedCheckinRunning ||
+                detectingAll
+              }
+            >
+              <RefreshCw size={14} className={selectedRefreshing ? "animate-spin" : ""} />
+              {text("刷新选中", "Refresh selected")}
+            </button>
+            <button
+              className="btn btn-success btn-sm gap-2"
+              onClick={() => void checkinSelectedAccounts()}
+              disabled={
+                selectedAccountIds.length === 0 ||
+                selectedCheckinRunning ||
+                autoCheckinRunning ||
+                detectingAll ||
+                loading ||
+                refreshingBalances ||
+                selectedRefreshing
+              }
+            >
+              <CheckCircle2 size={14} className={selectedCheckinRunning ? "animate-pulse" : ""} />
+              {selectedCheckinRunning ? t("hub.running") : text("签到选中", "Check in selected")}
+            </button>
+          </div>
           <div className="ml-auto text-sm text-base-content/60">
             {t("common.total")}: {filteredAccounts.length}
           </div>
@@ -737,6 +906,22 @@ export default function HubPage() {
             <table className="table table-sm">
               <thead>
                 <tr>
+                  <th className="w-12">
+                    <input
+                      type="checkbox"
+                      className="checkbox checkbox-sm"
+                      checked={allFilteredSelected}
+                      onChange={(event) => {
+                        if (event.target.checked) {
+                          selectAllFilteredAccounts();
+                        } else {
+                          setSelectedAccountIds((prev) =>
+                            prev.filter((id) => !filteredAccountIds.includes(id)),
+                          );
+                        }
+                      }}
+                    />
+                  </th>
                   <th>{t("hub.site")}</th>
                   <th>{t("hub.type")}</th>
                   <th>{t("hub.username")}</th>
@@ -753,11 +938,20 @@ export default function HubPage() {
                   const detection = detectionMap[account.id];
                   const status = rowStatus(account);
                   const isBusy = busyAccountId === account.id;
+                  const isSelected = selectedAccountIds.includes(account.id);
                   const balance = account.account_info.quota;
                   const todayUsage = account.account_info.today_quota_consumption;
 
                   return (
                     <tr key={account.id}>
+                      <td>
+                        <input
+                          type="checkbox"
+                          className="checkbox checkbox-sm"
+                          checked={isSelected}
+                          onChange={() => toggleSelectedAccount(account.id)}
+                        />
+                      </td>
                       <td>
                         <div className="font-medium">{account.site_name}</div>
                         <div className="text-xs text-base-content/50">{account.site_url}</div>
@@ -791,16 +985,16 @@ export default function HubPage() {
                       </td>
                       <td>
                         <div className="flex gap-1 flex-wrap">
-                          <button className="btn btn-ghost btn-xs" onClick={() => detectOne(account)} disabled={isBusy || detectingAll || autoCheckinRunning}>
+                          <button className="btn btn-ghost btn-xs" onClick={() => detectOne(account)} disabled={isBusy || detectingAll || autoCheckinRunning || selectedCheckinRunning || selectedRefreshing}>
                             {isBusy ? <Loader2 size={12} className="animate-spin" /> : <ScanSearch size={12} />} {t("hub.actionDetect")}
                           </button>
-                          <button className="btn btn-ghost btn-xs" onClick={() => checkinOne(account)} disabled={isBusy || detectingAll || autoCheckinRunning}>
+                          <button className="btn btn-ghost btn-xs" onClick={() => checkinOne(account)} disabled={isBusy || detectingAll || autoCheckinRunning || selectedCheckinRunning || selectedRefreshing}>
                             <CheckCircle2 size={12} /> {t("hub.actionCheckin")}
                           </button>
-                          <button className="btn btn-ghost btn-xs" onClick={() => openTokenModal(account)} disabled={isBusy || detectingAll || autoCheckinRunning}>
+                          <button className="btn btn-ghost btn-xs" onClick={() => openTokenModal(account)} disabled={isBusy || detectingAll || autoCheckinRunning || selectedCheckinRunning || selectedRefreshing}>
                             <KeyRound size={12} /> {t("hub.actionTokens")}
                           </button>
-                          <button className="btn btn-ghost btn-xs" onClick={() => openPricingModal(account)} disabled={isBusy || detectingAll || autoCheckinRunning}>
+                          <button className="btn btn-ghost btn-xs" onClick={() => openPricingModal(account)} disabled={isBusy || detectingAll || autoCheckinRunning || selectedCheckinRunning || selectedRefreshing}>
                             <ChartNoAxesCombined size={12} /> {t("hub.actionPricing")}
                           </button>
                         </div>

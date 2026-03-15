@@ -31,6 +31,7 @@ const COMMAND_MAPPING: CommandMapping = {
   generate_cli_config: { url: "/api/cli/generate-config", method: "POST" },
   write_cli_config: { url: "/api/cli/write-config", method: "POST" },
   validate_api_key: { url: "/api/validate-key", method: "POST" },
+  refresh_selected_hub_balances: { url: "/api/hub/refresh-selected-balances", method: "POST" },
 };
 
 export async function request<T>(

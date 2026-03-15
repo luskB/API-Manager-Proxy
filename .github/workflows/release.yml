@@ -130,25 +130,15 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Releasing APIManager v$VERSION"
+          echo "Releasing APIManagerProxy v$VERSION"
 
       - name: Create GitHub Release
         uses: ncipollo/release-action@v1
         with:
           allowUpdates: true
-          name: "APIManager v${{ steps.version.outputs.version }}"
+          name: "APIManagerProxy v${{ steps.version.outputs.version }}"
           tag: ${{ github.ref_name }}
-          body: |
-            ## APIManager v${{ steps.version.outputs.version }}
-
-            ### Download
-
-            | Platform | Architecture | File |
-            |----------|-------------|------|
-            | macOS | Apple Silicon (aarch64) | `.dmg` |
-            | macOS | Intel (x86_64) | `.dmg` |
-            | Windows | x64 | `.msi` / `.exe` |
-            | Linux | x64 | `.deb` / `.AppImage` / `.rpm` |
+          bodyFile: RELEASE_NOTES.md
           token: ${{ secrets.GITHUB_TOKEN }}
           artifacts: "all-artifacts/**/*"
           artifactErrorsFailBuild: false

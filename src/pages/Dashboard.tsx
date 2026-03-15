@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { request } from "../utils/request";
 import {
@@ -93,11 +93,34 @@ export default function Dashboard() {
 
   const text = (zh: string, en: string) => (locale === "zh" ? zh : en);
 
-  useEffect(() => {
+  const refreshStatus = useCallback(() => {
     request<ProxyStatus>("get_proxy_status")
       .then(setStatus)
       .catch(() => setStatus({ running: false }));
   }, []);
+
+  useEffect(() => {
+    refreshStatus();
+
+    const quickRetryDelays = [400, 1200, 2500];
+    const retryTimers = quickRetryDelays.map((delay) =>
+      window.setTimeout(refreshStatus, delay),
+    );
+    const pollTimer = window.setInterval(refreshStatus, 5000);
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        refreshStatus();
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      retryTimers.forEach((timer) => window.clearTimeout(timer));
+      window.clearInterval(pollTimer);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [config?.proxy.auto_start, refreshStatus]);
 
   useEffect(() => {
     if (!config || config.proxy_accounts.length === 0) {

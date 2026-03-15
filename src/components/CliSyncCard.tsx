@@ -172,6 +172,7 @@ export default function CliSyncCard({
   >(initRecord(null));
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [selectedModels, setSelectedModels] = useState<string[]>([]);
+  const [useAllDiscoveredModels, setUseAllDiscoveredModels] = useState(true);
   const [modelFilter, setModelFilter] = useState("");
   const [editorState, setEditorState] = useState<EditorState | null>(null);
   const { t, locale } = useLocale();
@@ -197,8 +198,8 @@ export default function CliSyncCard({
   }, [availableModels, modelFilter]);
 
   const effectiveModels = useMemo(
-    () => (selectedModels.length > 0 ? selectedModels : availableModels),
-    [availableModels, selectedModels],
+    () => (useAllDiscoveredModels ? availableModels : selectedModels),
+    [availableModels, selectedModels, useAllDiscoveredModels],
   );
 
   const defaultModel = effectiveModels[0] ?? null;
@@ -259,6 +260,7 @@ export default function CliSyncCard({
   }, [checkStatus]);
 
   const toggleSelectedModel = (model: string) => {
+    setUseAllDiscoveredModels(false);
     setSelectedModels((prev) =>
       prev.includes(model)
         ? prev.filter((item) => item !== model)
@@ -267,10 +269,37 @@ export default function CliSyncCard({
   };
 
   const selectVisibleModels = () => {
+    setUseAllDiscoveredModels(false);
     setSelectedModels((prev) => dedupe([...prev, ...visibleModels]));
   };
 
+  const syncAllModels = () => {
+    if (
+      !window.confirm(
+        text(
+          "确认改为同步全部已发现模型吗？这会清空当前手动选择。",
+          "Sync all discovered models? This will clear the current manual selection.",
+        ),
+      )
+    ) {
+      return;
+    }
+    setUseAllDiscoveredModels(true);
+    setSelectedModels([]);
+  };
+
   const clearSelectedModels = () => {
+    if (
+      !window.confirm(
+        text(
+          "确认移除当前已选模型吗？移除后需要重新从列表中勾选要同步的模型。",
+          "Remove all currently selected models? You can reselect the models you want to sync from the list.",
+        ),
+      )
+    ) {
+      return;
+    }
+    setUseAllDiscoveredModels(false);
     setSelectedModels([]);
   };
 
@@ -463,13 +492,25 @@ export default function CliSyncCard({
             </p>
           </div>
           <div className="rounded-xl border border-base-300 bg-base-200/50 px-3 py-2 text-xs text-base-content/70">
-            {selectedModels.length > 0 ? (
+            {useAllDiscoveredModels ? (
+              <span>
+                {text(
+                  "当前将同步全部已发现模型",
+                  "All discovered models will be synced",
+                )}
+              </span>
+            ) : selectedModels.length > 0 ? (
               <span>
                 {text("已选择", "Selected")} {selectedModels.length}{" "}
                 {text("个模型", "models")}
               </span>
             ) : (
-              <span>{text("未手动选择时将同步全部已发现模型", "No manual selection means sync all discovered models")}</span>
+              <span>
+                {text(
+                  "当前未选择模型，点击同步时只会写入地址和密钥",
+                  "No models are selected right now, so syncing will only write the endpoint and API key.",
+                )}
+              </span>
             )}
             {defaultModel && (
               <div className="mt-1 font-mono text-[11px] text-base-content/55 truncate max-w-[18rem]">
@@ -501,10 +542,18 @@ export default function CliSyncCard({
             </button>
             <button
               className="btn btn-ghost btn-sm"
-              onClick={clearSelectedModels}
+              onClick={syncAllModels}
               type="button"
             >
               {text("同步全部", "Use all")}
+            </button>
+            <button
+              className="btn btn-ghost btn-sm text-error"
+              onClick={clearSelectedModels}
+              type="button"
+              disabled={selectedModels.length === 0}
+            >
+              {text("全部移除", "Remove all")}
             </button>
           </div>
         </div>
