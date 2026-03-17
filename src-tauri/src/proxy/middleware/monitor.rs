@@ -533,16 +533,10 @@ fn estimate_cost(
     let input = input_tokens.unwrap_or(0);
     let output = output_tokens.unwrap_or(0);
     if let Some(account_id) = account_id {
-        if let Some(cost) = crate::proxy::site_price_cache::global()
-            .estimate_cost(account_id, model_name, input, output)
-        {
-            return Some(cost);
-        }
+        return crate::proxy::site_price_cache::global()
+            .estimate_cost(account_id, model_name, input, output);
     }
-    if input == 0 && output == 0 {
-        return None;
-    }
-    crate::proxy::price_cache::global().estimate_cost(model_name, input, output)
+    None
 }
 
 pub fn recompute_estimated_cost_from_log(log: &ProxyRequestLog) -> Option<f64> {

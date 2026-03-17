@@ -1187,17 +1187,6 @@ impl TokenManager {
                             }
                         }
 
-                        // Refresh price cache if needed
-                        {
-                            let price_cache = crate::proxy::price_cache::global();
-                            if price_cache.needs_refresh() {
-                                let pc = price_cache.clone();
-                                tokio::spawn(async move {
-                                    pc.refresh().await;
-                                });
-                            }
-                        }
-
                         // Persist proxy stats if dirty
                         {
                             let stats = crate::proxy::proxy_stats::global();

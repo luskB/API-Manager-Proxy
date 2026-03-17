@@ -114,14 +114,6 @@ impl AxumServer {
         // Load proxy stats from disk
         crate::proxy::proxy_stats::global().load_from_disk();
 
-        // Start price cache background refresh
-        {
-            let pc = crate::proxy::price_cache::global();
-            tokio::spawn(async move {
-                pc.refresh().await;
-            });
-        }
-
         // Load models from disk cache first (instant, no network).
         // Only fetch from upstreams if cache is empty (first-ever launch).
         {

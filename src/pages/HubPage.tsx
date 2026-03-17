@@ -63,10 +63,28 @@ interface GroupRow {
 
 interface PricingRow {
   model: string;
-  input?: number;
-  output?: number;
+  input: string;
+  output: string;
+  typeLabel: string;
+  groups: string[];
+}
+
+interface PricingMetaRow {
+  model: string;
   quotaType?: number;
   groups: string[];
+}
+
+interface ProxyModelPriceQuote {
+  billing_mode: "tokens" | "requests" | "mixed";
+  source_count: number;
+  from_site_pricing: boolean;
+  input_per_million?: number;
+  output_per_million?: number;
+  input_per_million_max?: number;
+  output_per_million_max?: number;
+  request_price?: number;
+  request_price_max?: number;
 }
 
 interface CreateTokenForm {
@@ -160,7 +178,7 @@ function parseGroups(raw: unknown): GroupRow[] {
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-function parsePricing(raw: unknown): PricingRow[] {
+function parsePricingMeta(raw: unknown): PricingMetaRow[] {
   if (!raw || typeof raw !== "object") return [];
   const payload = raw as Record<string, unknown>;
   const data =
@@ -171,7 +189,6 @@ function parsePricing(raw: unknown): PricingRow[] {
   return Object.entries(data)
     .map(([model, info]) => {
       const row = (info ?? {}) as Record<string, unknown>;
-      const modelPrice = row.model_price as Record<string, unknown> | number | string | undefined;
       const groups = Array.isArray(row.enable_groups)
         ? row.enable_groups.map((v) => String(v))
         : Array.isArray(row.groups)
@@ -185,45 +202,78 @@ function parsePricing(raw: unknown): PricingRow[] {
             ? 1
             : 0
           : toNumber(quotaTypeRaw);
-      const scalarModelPrice =
-        typeof modelPrice === "number" || typeof modelPrice === "string" ? toNumber(modelPrice) : undefined;
-      const nestedInput =
-        typeof modelPrice === "object" && modelPrice
-          ? toNumber((modelPrice as Record<string, unknown>).input)
-          : undefined;
-      const nestedOutput =
-        typeof modelPrice === "object" && modelPrice
-          ? toNumber((modelPrice as Record<string, unknown>).output)
-          : undefined;
-      const modelRatio = toNumber(row.model_ratio);
-      const completionRatio = toNumber(row.completion_ratio) ?? 1;
-      const tokenInputFallback =
-        nestedInput ??
-        toNumber(row.input) ??
-        modelRatio ??
-        (quotaType === 1 ? scalarModelPrice : undefined) ??
-        scalarModelPrice;
-      const input =
-        quotaType === 1
-          ? scalarModelPrice ?? nestedInput ?? toNumber(row.input) ?? modelRatio
-          : tokenInputFallback;
-      const output =
-        quotaType === 1
-          ? scalarModelPrice ?? nestedOutput ?? toNumber(row.output) ?? input
-          : nestedOutput ??
-            toNumber(row.output) ??
-            (tokenInputFallback != null ? tokenInputFallback * completionRatio : undefined) ??
-            scalarModelPrice;
 
       return {
         model,
-        quotaType,
-        input,
-        output,
+        quotaType: quotaType ?? undefined,
         groups,
       };
     })
     .sort((a, b) => a.model.localeCompare(b.model));
+}
+
+function formatPriceNumber(value?: number): string {
+  if (value == null || !Number.isFinite(value)) return "-";
+  if (value >= 1) return value.toFixed(4).replace(/\.?0+$/, "");
+  return value.toFixed(6).replace(/\.?0+$/, "");
+}
+
+function formatPriceRange(
+  min?: number,
+  max?: number,
+  formatter: (value?: number) => string = formatPriceNumber,
+): string {
+  if (min == null && max == null) return "-";
+  const start = min ?? max;
+  const end = max ?? min;
+  if (start == null || end == null) return "-";
+  if (Math.abs(start - end) < 1e-9) return formatter(start);
+  return `${formatter(start)}-${formatter(end)}`;
+}
+
+function buildPricingRows(
+  raw: unknown,
+  quotes: Record<string, ProxyModelPriceQuote>,
+  text: (zh: string, en: string) => string,
+): PricingRow[] {
+  return parsePricingMeta(raw).map((row) => {
+    const quote = quotes[row.model];
+    if (!quote || !quote.from_site_pricing) {
+      return {
+        model: row.model,
+        input: "-",
+        output: "-",
+        typeLabel: text("未获取", "Unavailable"),
+        groups: row.groups,
+      };
+    }
+
+    if (quote.billing_mode === "requests") {
+      const request = quote.request_price != null ? `$${formatPriceRange(quote.request_price, quote.request_price_max)}/次` : "-";
+      return {
+        model: row.model,
+        input: request,
+        output: request,
+        typeLabel: text("按次", "Per request"),
+        groups: row.groups,
+      };
+    }
+
+    const input = quote.input_per_million != null
+      ? `$${formatPriceRange(quote.input_per_million, quote.input_per_million_max)}/1M`
+      : "-";
+    const output = quote.output_per_million != null
+      ? `$${formatPriceRange(quote.output_per_million, quote.output_per_million_max)}/1M`
+      : "-";
+
+    return {
+      model: row.model,
+      input,
+      output,
+      typeLabel: quote.billing_mode === "mixed" ? text("混合", "Mixed") : text("按量", "Per token"),
+      groups: row.groups,
+    };
+  });
 }
 
 export default function HubPage() {
@@ -735,7 +785,15 @@ export default function HubPage() {
         request<unknown>("hub_fetch_model_pricing", { account_id: account.id }),
         request<unknown>("hub_fetch_user_groups", { account_id: account.id }),
       ]);
-      setPricingRows(parsePricing(pricingRaw));
+      const pricingMeta = parsePricingMeta(pricingRaw);
+      const quotes =
+        pricingMeta.length > 0
+          ? await request<Record<string, ProxyModelPriceQuote>>("get_proxy_model_prices", {
+              models: pricingMeta.map((row) => row.model),
+              account_ids: [account.id],
+            })
+          : {};
+      setPricingRows(buildPricingRows(pricingRaw, quotes ?? {}, text));
       setPricingGroups(parseGroups(groupsRaw));
     } catch (e) {
       setPricingError(String(e));
@@ -1180,9 +1238,9 @@ export default function HubPage() {
                               {pricingRows.map((row) => (
                                 <tr key={row.model}>
                                   <td className="font-mono text-xs">{row.model}</td>
-                                  <td className="font-mono text-xs">{row.input ?? "-"}</td>
-                                  <td className="font-mono text-xs">{row.output ?? "-"}</td>
-                                  <td>{row.quotaType === 1 ? t("hub.pricingTypeTimes") : t("hub.pricingTypeToken")}</td>
+                                  <td className="font-mono text-xs">{row.input}</td>
+                                  <td className="font-mono text-xs">{row.output}</td>
+                                  <td>{row.typeLabel}</td>
                                   <td className="text-xs">{row.groups.length > 0 ? row.groups.join(", ") : "-"}</td>
                                 </tr>
                               ))}

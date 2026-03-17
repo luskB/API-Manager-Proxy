@@ -243,13 +243,7 @@ fn event_effective_cost(event: &StatsEvent) -> f64 {
         }
     }
 
-    if event.estimated_cost > 0.0 {
-        return event.estimated_cost;
-    }
-
-    crate::proxy::price_cache::global()
-        .estimate_cost(model, event.input_tokens as i32, event.output_tokens as i32)
-        .unwrap_or(event.estimated_cost)
+    event.estimated_cost
 }
 
 // ---------------------------------------------------------------------------
@@ -289,12 +283,6 @@ impl StatsAccumulator {
                 })
             })
             .or(log.estimated_cost)
-            .or_else(|| {
-                log.model.as_deref().and_then(|model| {
-                    crate::proxy::price_cache::global()
-                        .estimate_cost(model, input as i32, output as i32)
-                })
-            })
             .unwrap_or(0.0);
 
         // Update global

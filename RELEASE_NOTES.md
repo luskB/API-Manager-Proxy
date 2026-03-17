@@ -1,35 +1,35 @@
-## APIManagerProxy v1.7.1
+## APIManagerProxy v1.7.2
 
-This release packages the latest stable state of the desktop proxy app and focuses on reliability around CLI sync, local proxy behavior, and day-to-day account operations.
+This release publishes the current stable desktop build and rolls up the latest proxy, monitoring, Hub, token-statistics, and CLI-sync improvements into a new tagged baseline.
 
 ### Highlights
 
-- Stabilized CLI model sync behavior for local agent tools.
-  Model selections now remain easier to reason about when syncing to tools like OpenCode and Claude Code, while keeping the proxy-facing model routing behavior consistent.
+- Improved model-source clarity across the app.
+  Site-aware model labels, route-aware selection behavior, and source visibility improvements are carried forward for both proxy usage and CLI sync workflows.
 
-- Improved proxy workflow diagnostics and recoverability.
-  The current build keeps the existing proxy flow intact while preserving recent fixes around status refreshes, port-conflict handling, and source-site visibility in model pickers.
+- Refined operational screens for daily use.
+  Dashboard, Hub, monitoring, and token-statistics views include the latest interaction fixes, time-window behavior, and UI refinements from the current workspace state.
 
-- Refined UI behavior across monitoring, Hub management, and token statistics.
-  Bulk actions, time-window views, and operational panels are carried forward in a cleaner release baseline.
+- Preserved the current local proxy workflow while keeping recent quality-of-life updates.
+  The release keeps the existing desktop proxy behavior intact while packaging the latest stable changes from the local project.
 
-### Included fixes
+### Included in this release
 
-- Preserved current CLI sync compatibility without bundling local machine configuration into the repository.
-- Kept proxy page model-source tooltips and routing-aware model selection behavior.
-- Carried forward the recent dashboard, monitoring, Hub, and token-statistics improvements into a tagged release.
+- Current CLI sync UI and selection management updates.
+- Recent monitoring and token-statistics screen improvements.
+- Ongoing proxy, Hub, and account-management refinements from the current stable codebase.
 
 ### Privacy and packaging
 
 - This release is built from repository source only.
-- Local runtime configuration, browser profiles, logs, caches, and build outputs remain excluded from source control.
+- Local runtime configuration, API keys, tokens, browser profiles, caches, logs, and build outputs remain excluded from source control.
 - GitHub Release artifacts are produced by Actions from the sanitized repository state.
 
 ### Downloads
 
 | Platform | Architecture | File |
 | --- | --- | --- |
-| Windows | x64 | `APIManagerProxy_1.7.1_x64-setup.exe` |
-| Windows | x64 | `APIManagerProxy_1.7.1_x64_en-US.msi` |
+| Windows | x64 | `APIManagerProxy_1.7.2_x64-setup.exe` |
+| Windows | x64 | `APIManagerProxy_1.7.2_x64_en-US.msi` |
 | macOS | Apple Silicon / Intel | Built by GitHub Actions |
 | Linux | x64 | Built by GitHub Actions |

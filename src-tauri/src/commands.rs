@@ -591,7 +591,6 @@ pub async fn get_logs(
     state: tauri::State<'_, ProxyServiceState>,
 ) -> Result<serde_json::Value, String> {
     refresh_site_price_cache_if_needed().await;
-    refresh_price_cache_if_needed().await;
     let monitor = state.monitor.read().await;
 
     if let Some(ref mon) = *monitor {
@@ -811,7 +810,6 @@ pub async fn get_proxy_stats() -> Result<serde_json::Value, String> {
 #[tauri::command]
 pub async fn get_proxy_stats_view(scope: Option<String>) -> Result<serde_json::Value, String> {
     refresh_site_price_cache_if_needed().await;
-    refresh_price_cache_if_needed().await;
     let scope = scope
         .as_deref()
         .and_then(StatsScope::parse)
@@ -823,7 +821,6 @@ pub async fn get_proxy_stats_view(scope: Option<String>) -> Result<serde_json::V
 #[tauri::command]
 pub async fn get_token_stats_view(scope: Option<String>) -> Result<serde_json::Value, String> {
     refresh_site_price_cache_if_needed().await;
-    refresh_price_cache_if_needed().await;
     let scope = scope
         .as_deref()
         .and_then(StatsScope::parse)
@@ -876,10 +873,8 @@ pub async fn get_proxy_model_prices(
     account_ids: Option<Vec<String>>,
 ) -> Result<HashMap<String, ProxyModelPriceQuote>, String> {
     refresh_site_price_cache_if_needed().await;
-    refresh_price_cache_if_needed().await;
 
     let site_cache = crate::proxy::site_price_cache::global();
-    let generic_cache = crate::proxy::price_cache::global();
     let account_ids = account_ids.unwrap_or_default();
     let mut prices = HashMap::new();
     for model in models {
@@ -902,24 +897,6 @@ pub async fn get_proxy_model_prices(
                     request_price_max: price.request_price_max,
                 },
             );
-            continue;
-        }
-
-        if let Some(price) = generic_cache.get_price(key) {
-            prices.insert(
-                key.to_string(),
-                ProxyModelPriceQuote {
-                    billing_mode: crate::proxy::site_price_cache::SiteModelBillingMode::Tokens,
-                    source_count: 0,
-                    from_site_pricing: false,
-                    input_per_million: Some(price.input_cost_per_token * 1_000_000.0),
-                    output_per_million: Some(price.output_cost_per_token * 1_000_000.0),
-                    input_per_million_max: Some(price.input_cost_per_token * 1_000_000.0),
-                    output_per_million_max: Some(price.output_cost_per_token * 1_000_000.0),
-                    request_price: None,
-                    request_price_max: None,
-                },
-            );
         }
     }
 
@@ -931,13 +908,6 @@ fn now_millis() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
-}
-
-async fn refresh_price_cache_if_needed() {
-    let cache = crate::proxy::price_cache::global();
-    if cache.is_empty() || cache.needs_refresh() {
-        cache.refresh().await;
-    }
 }
 
 async fn refresh_site_price_cache_if_needed() {

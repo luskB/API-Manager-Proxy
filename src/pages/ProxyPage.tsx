@@ -607,7 +607,7 @@ export default function ProxyPage() {
   function legacyPriceTooltip(model: string): string {
     const price = modelPrices[model];
     if (!price) {
-      return text("Pricing unavailable", "Pricing unavailable");
+      return text("未获取站点价格", "Site pricing unavailable");
     }
     return text(
       `输入 $${formatUsdPerMillion(price.input_per_million)}/1M · 输出 $${formatUsdPerMillion(price.output_per_million)}/1M`,
@@ -618,7 +618,7 @@ export default function ProxyPage() {
   function priceTooltip(model: string): string {
     const price = modelPrices[model];
     if (!price) {
-      return text("Pricing unavailable", "Pricing unavailable");
+      return text("未获取站点价格", "Site pricing unavailable");
     }
     const requestRange = formatRange(price.request_price, price.request_price_max);
     const inputRange = formatRange(price.input_per_million, price.input_per_million_max, formatUsdPerMillion);
