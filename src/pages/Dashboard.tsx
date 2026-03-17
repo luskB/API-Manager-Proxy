@@ -60,6 +60,16 @@ interface ScopedProxyStatsData {
 
 type StatsScope = "hourly" | "daily" | "weekly";
 
+const DASHBOARD_STATS_SCOPE_KEY = "apimanagerproxy.dashboard.statsScope";
+
+function readStoredScope(storageKey: string, fallback: StatsScope): StatsScope {
+  if (typeof window === "undefined") {
+    return fallback;
+  }
+  const value = window.localStorage.getItem(storageKey);
+  return value === "hourly" || value === "daily" || value === "weekly" ? value : fallback;
+}
+
 function StatCard({
   title,
   value,
@@ -87,7 +97,9 @@ export default function Dashboard() {
   const [status, setStatus] = useState<ProxyStatus | null>(null);
   const [models, setModels] = useState<string[]>([]);
   const [modelsLoading, setModelsLoading] = useState(false);
-  const [statsScope, setStatsScope] = useState<StatsScope>("daily");
+  const [statsScope, setStatsScope] = useState<StatsScope>(() =>
+    readStoredScope(DASHBOARD_STATS_SCOPE_KEY, "daily"),
+  );
   const [stats, setStats] = useState<ScopedProxyStatsData | null>(null);
   const { t, locale } = useLocale();
 
@@ -138,6 +150,10 @@ export default function Dashboard() {
     request<ScopedProxyStatsData>("get_proxy_stats_view", { scope: statsScope })
       .then((payload) => setStats(payload))
       .catch(() => setStats(null));
+  }, [statsScope]);
+
+  useEffect(() => {
+    window.localStorage.setItem(DASHBOARD_STATS_SCOPE_KEY, statsScope);
   }, [statsScope]);
 
   const scopeOptions: Array<{ value: StatsScope; label: string }> = useMemo(

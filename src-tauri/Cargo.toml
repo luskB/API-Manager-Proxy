@@ -1,6 +1,6 @@
 [package]
 name = "apimanagerproxy"
-version = "1.7.2"
+version = "1.7.3"
 description = "APIManagerProxy - Multi-site AI API aggregation proxy"
 authors = ["APIManagerProxy"]
 license = "MIT"

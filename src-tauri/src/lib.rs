@@ -131,6 +131,7 @@ pub fn run() {
             commands::proxy_stop,
             commands::get_proxy_status,
             commands::get_logs,
+            commands::sync_log_costs,
             commands::replay_request,
             commands::get_available_models,
             commands::get_proxy_stats,

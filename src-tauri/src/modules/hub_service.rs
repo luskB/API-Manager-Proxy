@@ -215,6 +215,29 @@ fn parse_today_usage_data(payload: &Value) -> Option<f64> {
     Some(total)
 }
 
+fn parse_consume_log_items(payload: &Value) -> Vec<Value> {
+    if let Some(arr) = payload.get("data").and_then(|value| value.as_array()) {
+        return arr.clone();
+    }
+
+    if let Some(arr) = payload
+        .get("data")
+        .and_then(|value| value.get("items"))
+        .and_then(|value| value.as_array())
+    {
+        return arr.clone();
+    }
+
+    if let Some(arr) = payload
+        .get("items")
+        .and_then(|value| value.as_array())
+    {
+        return arr.clone();
+    }
+
+    Vec::new()
+}
+
 fn is_json_success(payload: &Value) -> bool {
     if let Some(success) = payload.get("success").and_then(|v| v.as_bool()) {
         return success;
@@ -492,6 +515,73 @@ async fn fetch_today_usage(
         Ok(Some(value)) => Ok(Some(value)),
         Ok(None) | Err(_) => fetch_today_usage_data(client, account).await,
     }
+}
+
+pub async fn fetch_recent_consume_logs(
+    client: &reqwest::Client,
+    account: &SiteAccount,
+    start_timestamp: i64,
+    end_timestamp: i64,
+    page_size: usize,
+    max_pages: usize,
+) -> Result<Vec<Value>, String> {
+    let base = base_url(&account.site_url);
+    let headers = build_auth_headers(account.account_info.id, &account.account_info.access_token);
+    let capped_page_size = page_size.clamp(1, 100);
+    let capped_pages = max_pages.clamp(1, 10);
+
+    let mut page = 0usize;
+    let mut merged = Vec::new();
+    let mut last_error: Option<String> = None;
+
+    while page < capped_pages {
+        let url = format!(
+            "{}/api/log/self?type=2&p={}&page_size={}&start_timestamp={}&end_timestamp={}",
+            base,
+            page,
+            capped_page_size,
+            start_timestamp,
+            end_timestamp
+        );
+
+        match get_json(client, &url, headers.clone()).await {
+            Ok((status, payload)) => {
+                if !(200..300).contains(&status) {
+                    last_error = Some(format!("Fetch consume logs failed (HTTP {})", status));
+                    break;
+                }
+                if !is_json_success(&payload) {
+                    last_error = extract_message(&payload);
+                    break;
+                }
+
+                let items = parse_consume_log_items(&payload);
+                if items.is_empty() {
+                    break;
+                }
+
+                let item_count = items.len();
+                merged.extend(items);
+                if item_count < capped_page_size {
+                    break;
+                }
+            }
+            Err(error) => {
+                last_error = Some(error);
+                break;
+            }
+        }
+
+        page += 1;
+    }
+
+    if merged.is_empty() {
+        if let Some(error) = last_error {
+            return Err(error);
+        }
+    }
+
+    Ok(merged)
 }
 
 pub async fn fetch_checkin_status(

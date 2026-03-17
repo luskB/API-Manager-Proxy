@@ -10,10 +10,12 @@ use crate::modules::{backup, browser_login, browser_storage, config, desktop, hu
 use crate::proxy::key_fetcher::{has_usable_api_key, populate_api_keys_for_accounts, ApiKeyFetchScope};
 use crate::proxy::middleware::SecurityConfig;
 use crate::proxy::model_router::ModelRouter;
-use crate::proxy::monitor::ProxyMonitor;
+use crate::proxy::monitor::{BillingSyncUpdate, ProxyMonitor, ProxyRequestLog, SiteBillingSnapshot};
 use crate::proxy::proxy_stats::StatsScope;
 use crate::proxy::server::ProxyServerHandle;
 use crate::proxy::token_manager::{AccountModels, TokenManager};
+
+const SITE_QUOTA_PER_USD: f64 = 500_000.0;
 
 /// Managed state for proxy server lifecycle.
 #[derive(Clone)]
@@ -586,25 +588,23 @@ pub async fn get_proxy_status(
     }))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn get_logs(
     state: tauri::State<'_, ProxyServiceState>,
+    minutes: Option<u32>,
 ) -> Result<serde_json::Value, String> {
-    refresh_site_price_cache_if_needed().await;
     let monitor = state.monitor.read().await;
 
     if let Some(ref mon) = *monitor {
-        let logs: Vec<Value> = mon
-            .get_logs(0, 100)
+        let logs = filter_logs_for_window(mon.get_logs(0, mon.get_count()), minutes);
+        let shown_logs: Vec<Value> = logs
             .into_iter()
-            .map(|mut log| {
-                log.estimated_cost = crate::proxy::middleware::monitor::recompute_estimated_cost_from_log(&log);
-                serde_json::to_value(log).unwrap_or(Value::Null)
-            })
+            .take(100)
+            .map(|log| serde_json::to_value(log).unwrap_or(Value::Null))
             .collect();
         Ok(serde_json::json!({
-            "total": mon.get_count(),
-            "logs": logs,
+            "total": shown_logs.len(),
+            "logs": shown_logs,
         }))
     } else {
         Ok(serde_json::json!({
@@ -612,6 +612,166 @@ pub async fn get_logs(
             "logs": [],
         }))
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SyncLogCostsResponse {
+    matched: usize,
+    unmatched: usize,
+    failed_accounts: usize,
+    synced_log_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SiteConsumeLogCandidate {
+    raw: Value,
+    created_at: i64,
+    model_name: Option<String>,
+    prompt_tokens: Option<i32>,
+    completion_tokens: Option<i32>,
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn sync_log_costs(
+    state: tauri::State<'_, ProxyServiceState>,
+    minutes: Option<u32>,
+    log_ids: Option<Vec<String>>,
+) -> Result<serde_json::Value, String> {
+    let monitor = state.monitor.read().await;
+    let mon = monitor.as_ref().ok_or_else(|| "Proxy not running".to_string())?;
+
+    let selected_ids: Option<HashSet<String>> = log_ids
+        .filter(|ids| !ids.is_empty())
+        .map(|ids| ids.into_iter().collect());
+    let window_logs = filter_logs_for_window(mon.get_logs(0, mon.get_count()), minutes);
+    let target_logs: Vec<ProxyRequestLog> = window_logs
+        .into_iter()
+        .filter(|log| {
+            selected_ids
+                .as_ref()
+                .map(|ids| ids.contains(&log.id))
+                .unwrap_or(true)
+        })
+        .collect();
+
+    if target_logs.is_empty() {
+        return serde_json::to_value(SyncLogCostsResponse {
+            matched: 0,
+            unmatched: 0,
+            failed_accounts: 0,
+            synced_log_ids: Vec::new(),
+        })
+        .map_err(|e| format!("Failed to serialize sync result: {}", e));
+    }
+
+    let cfg = config::load_app_config();
+    let account_map: HashMap<String, SiteAccount> = cfg
+        .accounts
+        .into_iter()
+        .map(|account| (account.id.clone(), account))
+        .collect();
+    let client = hub_http_client(cfg.proxy.request_timeout)?;
+
+    let mut grouped_logs: HashMap<String, Vec<ProxyRequestLog>> = HashMap::new();
+    let sync_timestamp = chrono::Utc::now().timestamp();
+    let mut updates = Vec::new();
+    let mut matched = 0usize;
+    let mut unmatched = 0usize;
+    let mut failed_accounts = 0usize;
+    let mut synced_log_ids = Vec::new();
+
+    for log in target_logs {
+        let Some(account_id) = log.account_id.clone() else {
+            updates.push(BillingSyncUpdate {
+                log_id: log.id.clone(),
+                estimated_cost: None,
+                cost_source: "site_unmatched".to_string(),
+                site_cost_text: None,
+                site_billing: None,
+                billing_synced_at: sync_timestamp,
+            });
+            unmatched += 1;
+            synced_log_ids.push(log.id.clone());
+            continue;
+        };
+        grouped_logs.entry(account_id).or_default().push(log);
+    }
+
+    for (account_id, logs) in grouped_logs {
+        let Some(account) = account_map.get(&account_id).cloned() else {
+            unmatched += logs.len();
+            continue;
+        };
+
+        let min_timestamp = logs
+            .iter()
+            .map(|log| log.timestamp)
+            .min()
+            .unwrap_or(sync_timestamp)
+            - 180;
+        let max_timestamp = logs
+            .iter()
+            .map(|log| log.timestamp)
+            .max()
+            .unwrap_or(sync_timestamp)
+            + 120;
+        let page_size = logs.len().clamp(20, 100);
+        let max_pages = ((logs.len() / 20).max(1)).clamp(1, 5);
+
+        let site_logs = match hub_service::fetch_recent_consume_logs(
+            &client,
+            &account,
+            min_timestamp,
+            max_timestamp,
+            page_size,
+            max_pages,
+        )
+        .await
+        {
+            Ok(items) => items,
+            Err(error) => {
+                failed_accounts += 1;
+                unmatched += logs.len();
+                tracing::warn!(
+                    account_id = %account_id,
+                    site_name = %account.site_name,
+                    error = %error,
+                    "Failed to synchronize site billing logs"
+                );
+                continue;
+            }
+        };
+
+        let mut candidates: Vec<SiteConsumeLogCandidate> = site_logs
+            .into_iter()
+            .filter_map(parse_site_consume_log_candidate)
+            .collect();
+
+        let mut account_updates = sync_logs_with_site_candidates(&logs, &mut candidates, sync_timestamp);
+        matched += account_updates
+            .iter()
+            .filter(|update| update.cost_source == "site_log")
+            .count();
+        unmatched += account_updates
+            .iter()
+            .filter(|update| update.cost_source == "site_unmatched")
+            .count();
+        synced_log_ids.extend(account_updates.iter().map(|update| update.log_id.clone()));
+        updates.append(&mut account_updates);
+    }
+
+    mon.apply_billing_updates(&updates);
+    let stats = crate::proxy::proxy_stats::global();
+    stats.apply_billing_updates(&updates);
+    stats.flush();
+
+    serde_json::to_value(SyncLogCostsResponse {
+        matched,
+        unmatched,
+        failed_accounts,
+        synced_log_ids,
+    })
+    .map_err(|e| format!("Failed to serialize sync result: {}", e))
 }
 
 #[tauri::command]
@@ -901,6 +1061,268 @@ pub async fn get_proxy_model_prices(
     }
 
     Ok(prices)
+}
+
+fn filter_logs_for_window(logs: Vec<ProxyRequestLog>, minutes: Option<u32>) -> Vec<ProxyRequestLog> {
+    let window_minutes = minutes.unwrap_or(60).max(1) as i64;
+    let cutoff = chrono::Utc::now().timestamp() - window_minutes * 60;
+    logs.into_iter()
+        .filter(|log| log.timestamp >= cutoff)
+        .collect()
+}
+
+fn parse_site_consume_log_candidate(item: Value) -> Option<SiteConsumeLogCandidate> {
+    Some(SiteConsumeLogCandidate {
+        created_at: value_to_i64(
+            item.get("created_at")
+                .or_else(|| item.get("createdAt"))
+                .or_else(|| item.get("timestamp")),
+        )?,
+        model_name: item
+            .get("model_name")
+            .and_then(value_to_string)
+            .or_else(|| item.get("model").and_then(value_to_string)),
+        prompt_tokens: value_to_i32(
+            item.get("prompt_tokens")
+                .or_else(|| item.get("promptToken"))
+                .or_else(|| item.get("input_tokens"))
+                .or_else(|| item.get("inputTokens")),
+        ),
+        completion_tokens: value_to_i32(
+            item.get("completion_tokens")
+                .or_else(|| item.get("completionToken"))
+                .or_else(|| item.get("output_tokens"))
+                .or_else(|| item.get("outputTokens")),
+        ),
+        raw: item,
+    })
+}
+
+fn sync_logs_with_site_candidates(
+    logs: &[ProxyRequestLog],
+    candidates: &mut Vec<SiteConsumeLogCandidate>,
+    sync_timestamp: i64,
+) -> Vec<BillingSyncUpdate> {
+    let mut used = vec![false; candidates.len()];
+    let mut updates = Vec::with_capacity(logs.len());
+
+    for log in logs {
+        let mut best_index = None;
+        let mut best_score = i64::MIN;
+
+        for (idx, candidate) in candidates.iter().enumerate() {
+            if used[idx] {
+                continue;
+            }
+
+            let Some(score) = site_log_match_score(log, candidate) else {
+                continue;
+            };
+
+            if score > best_score {
+                best_score = score;
+                best_index = Some(idx);
+            }
+        }
+
+        if let Some(idx) = best_index {
+            used[idx] = true;
+            let candidate = &candidates[idx];
+            updates.push(BillingSyncUpdate {
+                log_id: log.id.clone(),
+                estimated_cost: extract_direct_site_cost_number(&candidate.raw),
+                cost_source: "site_log".to_string(),
+                site_cost_text: build_site_cost_text(&candidate.raw),
+                site_billing: Some(build_site_billing_snapshot(&candidate.raw)),
+                billing_synced_at: sync_timestamp,
+            });
+        } else {
+            updates.push(BillingSyncUpdate {
+                log_id: log.id.clone(),
+                estimated_cost: None,
+                cost_source: "site_unmatched".to_string(),
+                site_cost_text: None,
+                site_billing: None,
+                billing_synced_at: sync_timestamp,
+            });
+        }
+    }
+
+    updates
+}
+
+fn site_log_match_score(log: &ProxyRequestLog, candidate: &SiteConsumeLogCandidate) -> Option<i64> {
+    let log_model = log.model.as_deref().map(normalize_monitor_model_name)?;
+    let candidate_model = candidate.model_name.as_deref().map(normalize_monitor_model_name)?;
+    if log_model != candidate_model {
+        return None;
+    }
+
+    let time_diff = (log.timestamp - candidate.created_at).abs();
+    if time_diff > 600 {
+        return None;
+    }
+
+    let mut score = 1_000 - time_diff;
+
+    match (
+        log.input_tokens,
+        candidate.prompt_tokens,
+        log.output_tokens,
+        candidate.completion_tokens,
+    ) {
+        (Some(log_in), Some(site_in), Some(log_out), Some(site_out)) => {
+            if log_in == site_in && log_out == site_out {
+                score += 10_000;
+            } else {
+                score -= ((log_in - site_in).abs() + (log_out - site_out).abs()) as i64;
+            }
+        }
+        (Some(log_in), Some(site_in), _, _) => {
+            if log_in == site_in {
+                score += 1_000;
+            }
+        }
+        (_, _, Some(log_out), Some(site_out)) => {
+            if log_out == site_out {
+                score += 1_000;
+            }
+        }
+        _ => {}
+    }
+
+    Some(score)
+}
+
+fn normalize_monitor_model_name(model: &str) -> String {
+    let trimmed = model.trim();
+    let raw = trimmed
+        .split_once("::")
+        .map(|(_, value)| value)
+        .unwrap_or(trimmed);
+    raw.to_ascii_lowercase()
+}
+
+fn value_to_i64(value: Option<&Value>) -> Option<i64> {
+    value.and_then(|item| {
+        item.as_i64()
+            .or_else(|| item.as_u64().and_then(|raw| i64::try_from(raw).ok()))
+            .or_else(|| item.as_str().and_then(|raw| raw.parse::<i64>().ok()))
+    })
+}
+
+fn value_to_i32(value: Option<&Value>) -> Option<i32> {
+    value_to_i64(value).and_then(|raw| i32::try_from(raw).ok())
+}
+
+fn value_to_f64(value: Option<&Value>) -> Option<f64> {
+    value.and_then(|item| {
+        item.as_f64()
+            .or_else(|| item.as_i64().map(|raw| raw as f64))
+            .or_else(|| item.as_u64().map(|raw| raw as f64))
+            .or_else(|| item.as_str().and_then(|raw| raw.parse::<f64>().ok()))
+    })
+}
+
+fn value_to_string(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(ToString::to_string)
+        .or_else(|| value.as_i64().map(|raw| raw.to_string()))
+        .or_else(|| value.as_u64().map(|raw| raw.to_string()))
+        .or_else(|| value.as_f64().map(|raw| raw.to_string()))
+}
+
+fn extract_direct_site_cost_number(item: &Value) -> Option<f64> {
+    value_to_f64(
+        item.get("display_cost")
+            .or_else(|| item.get("displayCost"))
+            .or_else(|| item.get("cost"))
+            .or_else(|| item.get("amount")),
+    )
+    .or_else(|| value_to_f64(item.get("quota")).map(|quota| quota / SITE_QUOTA_PER_USD))
+}
+
+fn build_site_cost_text(item: &Value) -> Option<String> {
+    let value = item
+        .get("display_cost")
+        .or_else(|| item.get("displayCost"))
+        .or_else(|| item.get("cost"))
+        .or_else(|| item.get("amount"));
+
+    if let Some(value) = value {
+        if let Some(text) = value.as_str() {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+
+        return value_to_f64(Some(value)).map(format_site_numeric);
+    }
+
+    value_to_f64(item.get("quota"))
+        .map(|quota| quota / SITE_QUOTA_PER_USD)
+        .map(format_site_numeric)
+}
+
+fn format_site_numeric(value: f64) -> String {
+    if (value.fract()).abs() < f64::EPSILON {
+        format!("{value:.0}")
+    } else {
+        let mut formatted = format!("{value:.6}");
+        while formatted.contains('.') && formatted.ends_with('0') {
+            formatted.pop();
+        }
+        if formatted.ends_with('.') {
+            formatted.pop();
+        }
+        formatted
+    }
+}
+
+fn build_site_billing_snapshot(item: &Value) -> SiteBillingSnapshot {
+    let other = item.get("other").and_then(|value| {
+        value
+            .as_str()
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .or_else(|| Some(value.clone()))
+    });
+
+    SiteBillingSnapshot {
+        created_at: value_to_i64(
+            item.get("created_at")
+                .or_else(|| item.get("createdAt"))
+                .or_else(|| item.get("timestamp")),
+        ),
+        model_name: item
+            .get("model_name")
+            .and_then(value_to_string)
+            .or_else(|| item.get("model").and_then(value_to_string)),
+        token_name: item
+            .get("token_name")
+            .and_then(value_to_string)
+            .or_else(|| item.get("tokenName").and_then(value_to_string)),
+        quota: value_to_f64(item.get("quota")),
+        prompt_tokens: value_to_i32(
+            item.get("prompt_tokens")
+                .or_else(|| item.get("promptToken"))
+                .or_else(|| item.get("input_tokens"))
+                .or_else(|| item.get("inputTokens")),
+        ),
+        completion_tokens: value_to_i32(
+            item.get("completion_tokens")
+                .or_else(|| item.get("completionToken"))
+                .or_else(|| item.get("output_tokens"))
+                .or_else(|| item.get("outputTokens")),
+        ),
+        content: item
+            .get("content")
+            .and_then(value_to_string)
+            .or_else(|| item.get("detail").and_then(value_to_string)),
+        other,
+        raw: item.clone(),
+    }
 }
 
 fn now_millis() -> i64 {
@@ -1714,4 +2136,67 @@ async fn fetch_models_openai(
     }
 
     Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn make_proxy_log(model: &str, ts: i64, input: i32, output: i32) -> ProxyRequestLog {
+        ProxyRequestLog {
+            id: "log-1".to_string(),
+            timestamp: ts,
+            method: "POST".to_string(),
+            url: "/v1/chat/completions".to_string(),
+            status: 200,
+            duration_ms: 120,
+            model: Some(model.to_string()),
+            account_id: Some("acc-1".to_string()),
+            upstream_url: None,
+            client_ip: None,
+            input_tokens: Some(input),
+            output_tokens: Some(output),
+            error: None,
+            estimated_cost: Some(0.123),
+            request_body: None,
+            original_request_body: None,
+            response_body: None,
+            api_key: None,
+            cost_source: Some("estimate".to_string()),
+            site_cost_text: None,
+            site_billing: None,
+            billing_synced_at: None,
+        }
+    }
+
+    #[test]
+    fn site_log_match_prefers_exact_model_and_tokens() {
+        let log = make_proxy_log("站点A::gpt-5.2", 1_700_000_000, 128, 64);
+        let good = parse_site_consume_log_candidate(json!({
+            "created_at": 1_700_000_001,
+            "model_name": "gpt-5.2",
+            "prompt_tokens": 128,
+            "completion_tokens": 64,
+            "quota": 50000
+        }))
+        .unwrap();
+        let bad = parse_site_consume_log_candidate(json!({
+            "created_at": 1_700_000_001,
+            "model_name": "gpt-5.2",
+            "prompt_tokens": 512,
+            "completion_tokens": 128,
+            "quota": 99999
+        }))
+        .unwrap();
+
+        assert!(site_log_match_score(&log, &good).unwrap() > site_log_match_score(&log, &bad).unwrap());
+    }
+
+    #[test]
+    fn build_site_cost_text_converts_quota_units_to_site_cost_display() {
+        let raw = json!({ "quota": 50000 });
+        assert_eq!(build_site_cost_text(&raw).as_deref(), Some("0.1"));
+        assert_eq!(extract_direct_site_cost_number(&raw), Some(0.1));
+    }
 }

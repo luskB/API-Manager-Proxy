@@ -141,6 +141,10 @@ pub async fn monitor_middleware(
         original_request_body: req_body_snapshot,
         response_body: resp_body_snapshot,
         api_key: auth_key.map(|k| k.key),
+        cost_source: Some("estimate".to_string()),
+        site_cost_text: None,
+        site_billing: None,
+        billing_synced_at: None,
     };
 
     // Record stats
@@ -244,6 +248,10 @@ fn wrap_sse_response(
             original_request_body: context.original_request_body,
             response_body,
             api_key: context.api_key,
+            cost_source: Some("estimate".to_string()),
+            site_cost_text: None,
+            site_billing: None,
+            billing_synced_at: None,
         };
 
         crate::proxy::proxy_stats::global().record(&log);

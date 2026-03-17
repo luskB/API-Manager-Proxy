@@ -3,6 +3,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SiteBillingSnapshot {
+    pub created_at: Option<i64>,
+    pub model_name: Option<String>,
+    pub token_name: Option<String>,
+    pub quota: Option<f64>,
+    pub prompt_tokens: Option<i32>,
+    pub completion_tokens: Option<i32>,
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other: Option<Value>,
+    pub raw: Value,
+}
 
 /// A single proxy request log entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +50,28 @@ pub struct ProxyRequestLog {
     /// API key identifier (key string) if request was authenticated via a user API key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// Cost source: "estimate", "site_log", or "site_unmatched".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_source: Option<String>,
+    /// Raw site-provided billing text/value to show in the monitor UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_cost_text: Option<String>,
+    /// Site-provided billing detail snapshot, if synchronized from upstream logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_billing: Option<SiteBillingSnapshot>,
+    /// When the site billing info was last synchronized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_synced_at: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BillingSyncUpdate {
+    pub log_id: String,
+    pub estimated_cost: Option<f64>,
+    pub cost_source: String,
+    pub site_cost_text: Option<String>,
+    pub site_billing: Option<SiteBillingSnapshot>,
+    pub billing_synced_at: i64,
 }
 
 /// In-memory ring buffer of proxy request logs.
@@ -106,6 +143,25 @@ impl ProxyMonitor {
         }
     }
 
+    /// Apply billing synchronization updates to existing logs by id.
+    pub fn apply_billing_updates(&self, updates: &[BillingSyncUpdate]) {
+        if updates.is_empty() {
+            return;
+        }
+
+        if let Ok(mut logs) = self.logs.write() {
+            for log in logs.iter_mut() {
+                if let Some(update) = updates.iter().find(|item| item.log_id == log.id) {
+                    log.estimated_cost = update.estimated_cost;
+                    log.cost_source = Some(update.cost_source.clone());
+                    log.site_cost_text = update.site_cost_text.clone();
+                    log.site_billing = update.site_billing.clone();
+                    log.billing_synced_at = Some(update.billing_synced_at);
+                }
+            }
+        }
+    }
+
     /// Enable or disable logging.
     pub fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::Relaxed);
@@ -147,6 +203,10 @@ mod tests {
             original_request_body: None,
             response_body: None,
             api_key: None,
+            cost_source: Some("estimate".to_string()),
+            site_cost_text: None,
+            site_billing: None,
+            billing_synced_at: None,
         }
     }
 

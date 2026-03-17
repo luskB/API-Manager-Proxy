@@ -18,6 +18,16 @@ import { request } from "../utils/request";
 type StatsScope = "hourly" | "daily" | "weekly";
 type DistributionMetric = "cost" | "tokens";
 
+const TOKEN_STATS_SCOPE_KEY = "apimanagerproxy.tokenStats.scope";
+
+function readStoredScope(storageKey: string, fallback: StatsScope): StatsScope {
+  if (typeof window === "undefined") {
+    return fallback;
+  }
+  const value = window.localStorage.getItem(storageKey);
+  return value === "hourly" || value === "daily" || value === "weekly" ? value : fallback;
+}
+
 interface AccountStats {
   total_requests: number;
   success_count: number;
@@ -183,7 +193,9 @@ function StatCard({
 
 export default function TokenStatsPage() {
   const { config, error, setError, reload } = useConfig();
-  const [scope, setScope] = useState<StatsScope>("daily");
+  const [scope, setScope] = useState<StatsScope>(() =>
+    readStoredScope(TOKEN_STATS_SCOPE_KEY, "daily"),
+  );
   const [stats, setStats] = useState<TokenStatsView | null>(null);
   const [loading, setLoading] = useState(false);
   const { locale } = useLocale();
@@ -216,6 +228,10 @@ export default function TokenStatsPage() {
       cancelled = true;
     };
   }, [scope, setError]);
+
+  useEffect(() => {
+    window.localStorage.setItem(TOKEN_STATS_SCOPE_KEY, scope);
+  }, [scope]);
 
   const scopeOptions = useMemo(
     () => [

@@ -1,11 +1,33 @@
 import { Fragment, useEffect, useState } from "react";
 import { request } from "../utils/request";
-import { RefreshCw, Timer, CheckCircle, XCircle, ChevronDown, ChevronRight, Copy, Play } from "lucide-react";
+import {
+  RefreshCw,
+  Timer,
+  CheckCircle,
+  XCircle,
+  ChevronDown,
+  ChevronRight,
+  Copy,
+  Play,
+  RotateCcw,
+} from "lucide-react";
 import { cn } from "../utils/cn";
 import { useConfig } from "../hooks/useConfig";
 import { useLocale } from "../hooks/useLocale";
 
-let monitorAutoRefreshEnabled = false;
+let monitorAutoRefreshEnabled = true;
+
+interface SiteBillingSnapshot {
+  created_at?: number;
+  model_name?: string;
+  token_name?: string;
+  quota?: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  content?: string;
+  other?: unknown;
+  raw: unknown;
+}
 
 interface ProxyRequestLog {
   id: string;
@@ -25,12 +47,25 @@ interface ProxyRequestLog {
   request_body?: string;
   original_request_body?: string;
   response_body?: string;
+  cost_source?: string;
+  site_cost_text?: string;
+  site_billing?: SiteBillingSnapshot;
+  billing_synced_at?: number;
 }
 
 interface LogsResponse {
   total: number;
   logs: ProxyRequestLog[];
 }
+
+interface SyncLogCostsResponse {
+  matched: number;
+  unmatched: number;
+  failed_accounts: number;
+  synced_log_ids: string[];
+}
+
+const DEFAULT_WINDOW_MINUTES = 60;
 
 export default function MonitorPage() {
   const [logs, setLogs] = useState<ProxyRequestLog[]>([]);
@@ -39,36 +74,65 @@ export default function MonitorPage() {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [replayResult, setReplayResult] = useState<{ status: number; body: string } | null>(null);
   const [replaying, setReplaying] = useState(false);
+  const [syncingCosts, setSyncingCosts] = useState(false);
+  const [windowMinutes, setWindowMinutes] = useState(DEFAULT_WINDOW_MINUTES);
+  const [syncMessage, setSyncMessage] = useState("");
   const { config } = useConfig();
   const [logError, setLogError] = useState("");
   const { t } = useLocale();
-
-  useEffect(() => {
-    loadLogs();
-  }, []);
 
   useEffect(() => {
     monitorAutoRefreshEnabled = autoRefresh;
   }, [autoRefresh]);
 
   useEffect(() => {
-    if (!autoRefresh) return;
-    const timer = setInterval(loadLogs, 3000);
-    return () => clearInterval(timer);
-  }, [autoRefresh]);
+    loadLogs(windowMinutes);
+  }, [windowMinutes]);
 
-  async function loadLogs() {
+  useEffect(() => {
+    if (!autoRefresh) return;
+    const timer = setInterval(() => {
+      void loadLogs(windowMinutes);
+    }, 3000);
+    return () => clearInterval(timer);
+  }, [autoRefresh, windowMinutes]);
+
+  async function loadLogs(minutes = windowMinutes) {
     try {
-      const data = await request<LogsResponse>("get_logs");
+      const data = await request<LogsResponse>("get_logs", { minutes });
       setLogs(data.logs || []);
       setTotal(data.total || 0);
+      setLogError("");
     } catch (e) {
       setLogError(String(e));
     }
   }
 
+  async function syncCosts() {
+    setSyncingCosts(true);
+    setSyncMessage("");
+    setLogError("");
+    try {
+      const result = await request<SyncLogCostsResponse>("sync_log_costs", {
+        minutes: windowMinutes,
+        log_ids: logs.map((log) => log.id),
+      });
+      const message = `${t("monitor.syncDone")}: ${result.matched} ${t("common.success").toLowerCase()}, ${result.unmatched} ${t("monitor.unmatched").toLowerCase()}`;
+      setSyncMessage(message);
+      await loadLogs(windowMinutes);
+    } catch (e) {
+      setLogError(String(e));
+    } finally {
+      setSyncingCosts(false);
+    }
+  }
+
   function formatTime(ts: number): string {
     return new Date(ts * 1000).toLocaleTimeString();
+  }
+
+  function formatDateTime(ts: number): string {
+    return new Date(ts * 1000).toLocaleString();
   }
 
   function copyCurl(log: ProxyRequestLog) {
@@ -99,35 +163,91 @@ export default function MonitorPage() {
     }
   }
 
-  function formatJson(raw: string): string {
-    try {
-      return JSON.stringify(JSON.parse(raw), null, 2);
-    } catch {
-      return raw;
+  function formatJson(raw: unknown): string {
+    if (raw == null) return "";
+    if (typeof raw === "string") {
+      try {
+        return JSON.stringify(JSON.parse(raw), null, 2);
+      } catch {
+        return raw;
+      }
     }
+    try {
+      return JSON.stringify(raw, null, 2);
+    } catch {
+      return String(raw);
+    }
+  }
+
+  function numericCostValue(log: ProxyRequestLog): number | null {
+    if (log.cost_source === "site_log" && log.site_cost_text) {
+      const raw = Number(log.site_cost_text);
+      if (Number.isFinite(raw)) {
+        return raw;
+      }
+    }
+    if (typeof log.estimated_cost === "number") {
+      return log.estimated_cost;
+    }
+    return null;
+  }
+
+  function formatSiteNumber(value: number): string {
+    if (Math.abs(value % 1) < Number.EPSILON) {
+      return value.toFixed(0);
+    }
+    return value.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+  }
+
+  function costDisplay(log: ProxyRequestLog): string {
+    if (log.cost_source === "site_log" && log.site_cost_text) {
+      return log.site_cost_text;
+    }
+    if (log.cost_source === "site_unmatched") {
+      return t("monitor.notSynced");
+    }
+    if (log.estimated_cost != null) {
+      return `$${log.estimated_cost.toFixed(4)}`;
+    }
+    return "-";
   }
 
   const successCount = logs.filter((l) => l.status >= 200 && l.status < 300).length;
   const errorCount = logs.filter((l) => l.status >= 400).length;
-  const totalCost = logs.reduce((sum, l) => sum + (l.estimated_cost ?? 0), 0);
+  const totalCost = logs.reduce((sum, log) => sum + (numericCostValue(log) ?? 0), 0);
+  const hasSyncedSiteCost = logs.some((log) => log.cost_source === "site_log");
 
   return (
     <div className="space-y-6">
-      <div className="flex justify-between items-center">
+      <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
         <div>
           <h1 className="text-2xl font-bold">{t("monitor.title")}</h1>
           <p className="text-base-content/60 mt-1">
             {t("monitor.subtitle")} ({total} {t("common.total").toLowerCase()})
           </p>
         </div>
-        <div className="flex gap-2">
-          <button className="btn btn-ghost btn-sm gap-2" onClick={loadLogs}>
+        <div className="flex w-full flex-nowrap items-center gap-2 overflow-x-auto xl:flex-1 xl:pl-6">
+          <label className="input input-sm input-bordered flex shrink-0 items-center gap-2">
+            <span className="text-xs text-base-content/60">{t("monitor.windowMinutes")}</span>
+            <input
+              type="number"
+              min={1}
+              step={1}
+              className="w-20"
+              value={windowMinutes}
+              onChange={(e) => {
+                const next = Number(e.target.value);
+                setWindowMinutes(Number.isFinite(next) && next > 0 ? next : DEFAULT_WINDOW_MINUTES);
+              }}
+            />
+          </label>
+          <button className="btn btn-ghost btn-sm shrink-0 gap-2" onClick={() => loadLogs(windowMinutes)}>
             <RefreshCw size={14} />
             {t("common.refresh")}
           </button>
           <button
             className={cn(
-              "btn btn-sm gap-2",
+              "btn btn-sm shrink-0 gap-2",
               autoRefresh ? "btn-primary" : "btn-ghost"
             )}
             onClick={() => setAutoRefresh(!autoRefresh)}
@@ -135,8 +255,22 @@ export default function MonitorPage() {
             <Timer size={14} />
             {autoRefresh ? t("monitor.autoOn") : t("monitor.autoOff")}
           </button>
+          <button
+            className="btn btn-ghost btn-sm shrink-0 gap-2"
+            onClick={() => void syncCosts()}
+            disabled={syncingCosts || logs.length === 0}
+          >
+            <RotateCcw size={14} className={cn(syncingCosts && "animate-spin")} />
+            {syncingCosts ? t("monitor.syncing") : t("monitor.syncCosts")}
+          </button>
         </div>
       </div>
+
+      {syncMessage && (
+        <div role="alert" className="alert alert-success">
+          <span>{syncMessage}</span>
+        </div>
+      )}
 
       {logError && (
         <div role="alert" className="alert alert-error">
@@ -165,8 +299,10 @@ export default function MonitorPage() {
         </div>
         {totalCost > 0 && (
           <div className="stat">
-            <div className="stat-title">{t("monitor.estCost")}</div>
-            <div className="stat-value text-lg">${totalCost.toFixed(4)}</div>
+            <div className="stat-title">{t("monitor.totalCost")}</div>
+            <div className="stat-value text-lg">
+              {hasSyncedSiteCost ? formatSiteNumber(totalCost) : `$${totalCost.toFixed(4)}`}
+            </div>
           </div>
         )}
       </div>
@@ -238,9 +374,7 @@ export default function MonitorPage() {
                           : "-"}
                       </td>
                       <td className="text-xs font-mono">
-                        {log.estimated_cost != null
-                          ? `$${log.estimated_cost.toFixed(4)}`
-                          : "-"}
+                        {costDisplay(log)}
                       </td>
                       <td onClick={(e) => e.stopPropagation()}>
                         <div className="flex gap-1">
@@ -288,6 +422,33 @@ export default function MonitorPage() {
                                 </pre>
                               </div>
                             </div>
+
+                            <div className="rounded-lg border border-base-300 bg-base-100 p-3 space-y-2">
+                              <div className="text-xs font-semibold">{t("monitor.siteBilling")}</div>
+                              {log.cost_source === "site_log" && log.site_billing ? (
+                                <div className="space-y-2 text-xs">
+                                  <div className="text-base-content/70">
+                                    {t("monitor.syncedAt")}: {log.billing_synced_at ? formatDateTime(log.billing_synced_at) : "-"}
+                                  </div>
+                                  <div className="text-base-content/70">
+                                    {t("monitor.siteCharge")}: {log.site_cost_text || "-"}
+                                  </div>
+                                  {log.site_billing.content && (
+                                    <div className="text-base-content/80 whitespace-pre-wrap break-all">
+                                      {log.site_billing.content}
+                                    </div>
+                                  )}
+                                  <pre className="bg-base-300 rounded p-2 text-xs overflow-auto max-h-64 whitespace-pre-wrap break-all">
+                                    {formatJson(log.site_billing.raw)}
+                                  </pre>
+                                </div>
+                              ) : log.cost_source === "site_unmatched" ? (
+                                <div className="text-xs text-base-content/60">{t("monitor.notSyncedHint")}</div>
+                              ) : (
+                                <div className="text-xs text-base-content/60">{t("monitor.siteBillingHint")}</div>
+                              )}
+                            </div>
+
                             {replayResult && expandedId === log.id && (
                               <div>
                                 <div className="text-xs font-semibold mb-1">{t("monitor.replayResult")} (status: {replayResult.status})</div>

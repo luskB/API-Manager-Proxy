@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::modules::config::get_data_dir;
-use crate::proxy::monitor::ProxyRequestLog;
+use crate::proxy::monitor::{BillingSyncUpdate, ProxyRequestLog};
 
 const STATS_FILE_NAME: &str = "proxy_stats.json";
 const RECENT_EVENT_RETENTION_SECS: i64 = 56 * 24 * 60 * 60;
@@ -58,6 +58,8 @@ pub struct HourlyBucket {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StatsEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_id: Option<String>,
     pub timestamp: i64,
     pub account_id: Option<String>,
     pub model: Option<String>,
@@ -228,21 +230,6 @@ fn event_total_tokens(event: &StatsEvent) -> u64 {
 }
 
 fn event_effective_cost(event: &StatsEvent) -> f64 {
-    let Some(model) = event.model.as_deref().filter(|value| !value.is_empty()) else {
-        return event.estimated_cost;
-    };
-
-    if let Some(account_id) = event.account_id.as_deref().filter(|value| !value.is_empty()) {
-        if let Some(cost) = crate::proxy::site_price_cache::global().estimate_cost(
-            account_id,
-            model,
-            event.input_tokens as i32,
-            event.output_tokens as i32,
-        ) {
-            return cost;
-        }
-    }
-
     event.estimated_cost
 }
 
@@ -374,6 +361,7 @@ impl StatsAccumulator {
         }
 
         data.recent_events.push_back(StatsEvent {
+            log_id: Some(log.id.clone()),
             timestamp: log.timestamp,
             account_id: log.account_id.clone(),
             model: log.model.clone(),
@@ -396,6 +384,99 @@ impl StatsAccumulator {
         }
 
         self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Apply billing synchronization updates to recent events and aggregate totals.
+    pub fn apply_billing_updates(&self, updates: &[BillingSyncUpdate]) {
+        if updates.is_empty() {
+            return;
+        }
+
+        let update_map: HashMap<&str, &BillingSyncUpdate> = updates
+            .iter()
+            .filter(|update| update.cost_source == "site_log")
+            .map(|update| (update.log_id.as_str(), update))
+            .collect();
+        if update_map.is_empty() {
+            return;
+        }
+
+        let mut data = match self.data.write() {
+            Ok(data) => data,
+            Err(_) => return,
+        };
+
+        let mut changed = false;
+        let mut cost_deltas: Vec<(Option<String>, Option<String>, Option<String>, i64, f64)> =
+            Vec::new();
+        for event in data.recent_events.iter_mut() {
+            let Some(log_id) = event.log_id.as_deref() else {
+                continue;
+            };
+            let Some(update) = update_map.get(log_id) else {
+                continue;
+            };
+            let Some(new_cost) = update.estimated_cost else {
+                continue;
+            };
+
+            let old_cost = event.estimated_cost;
+            let delta = new_cost - old_cost;
+            if delta.abs() < f64::EPSILON {
+                continue;
+            }
+
+            event.estimated_cost = new_cost;
+            cost_deltas.push((
+                event.account_id.clone(),
+                event.model.clone(),
+                event.api_key.clone(),
+                event.timestamp,
+                delta,
+            ));
+            changed = true;
+        }
+
+        if changed {
+            for (account_id, model, api_key, timestamp, delta) in cost_deltas {
+                data.global.total_estimated_cost += delta;
+
+                if let Some(account_id) = account_id.filter(|value| !value.is_empty()) {
+                    if let Some(stats) = data.per_account.get_mut(&account_id) {
+                        stats.total_estimated_cost += delta;
+                    }
+                }
+
+                if let Some(model) = model.filter(|value| !value.is_empty()) {
+                    if let Some(stats) = data.per_model.get_mut(&model) {
+                        stats.total_estimated_cost += delta;
+                    }
+                }
+
+                if let Some(api_key) = api_key.filter(|value| !value.is_empty()) {
+                    if let Some(stats) = data.per_key.get_mut(&api_key) {
+                        stats.total_cost += delta;
+                        let event_date = chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, 0)
+                            .map(|ts| ts.format("%Y-%m-%d").to_string())
+                            .unwrap_or_default();
+                        if !event_date.is_empty() && stats.today_date == event_date {
+                            stats.today_cost += delta;
+                        }
+                    }
+                }
+
+                let hour_ts = (timestamp / 3600) * 3600;
+                if let Some(bucket) = data
+                    .hourly_buckets
+                    .iter_mut()
+                    .find(|bucket| bucket.hour == hour_ts)
+                {
+                    bucket.total_cost += delta;
+                }
+            }
+
+            self.dirty.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Get a snapshot of current stats.
@@ -831,6 +912,10 @@ mod tests {
             original_request_body: None,
             response_body: None,
             api_key: None,
+            cost_source: Some("estimate".to_string()),
+            site_cost_text: None,
+            site_billing: None,
+            billing_synced_at: None,
         }
     }
 
@@ -868,5 +953,30 @@ mod tests {
             ..Default::default()
         };
         assert!((stats.avg_latency_ms() - 100.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn billing_sync_updates_recent_event_and_aggregates() {
+        let acc = StatsAccumulator::new();
+        let mut log = make_log("a", 200);
+        log.id = "sync-target".to_string();
+        log.estimated_cost = Some(0.01);
+        acc.record(&log);
+
+        acc.apply_billing_updates(&[BillingSyncUpdate {
+            log_id: "sync-target".to_string(),
+            estimated_cost: Some(0.002466),
+            cost_source: "site_log".to_string(),
+            site_cost_text: Some("0.002466".to_string()),
+            site_billing: None,
+            billing_synced_at: 0,
+        }]);
+
+        let stats = acc.get_stats();
+        assert!((stats.global.total_estimated_cost - 0.002466).abs() < 1e-9);
+        assert!((stats.per_account["a"].total_estimated_cost - 0.002466).abs() < 1e-9);
+
+        let token_view = acc.get_token_stats_view(StatsScope::Daily);
+        assert!((token_view.summary.total_estimated_cost - 0.002466).abs() < 1e-9);
     }
 }
