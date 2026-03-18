@@ -1634,6 +1634,7 @@ pub async fn refresh_selected_hub_balances(
 pub async fn detect_hub_account(
     account_id: String,
     include_details: Option<bool>,
+    state: tauri::State<'_, ProxyServiceState>,
 ) -> Result<crate::modules::hub_service::HubDetectionResult, String> {
     let mut cfg = config::load_app_config();
     let account = find_account_by_id(&cfg, &account_id)?;
@@ -1644,6 +1645,8 @@ pub async fn detect_hub_account(
 
     persist_detection_to_config(&mut cfg, &detection);
     config::save_app_config(&cfg)?;
+    sync_detected_models_to_cache(&state, &cfg.proxy_accounts, std::slice::from_ref(&detection))
+        .await;
 
     Ok(detection)
 }
@@ -1651,6 +1654,7 @@ pub async fn detect_hub_account(
 #[tauri::command(rename_all = "snake_case")]
 pub async fn detect_all_hub_accounts(
     include_details: Option<bool>,
+    state: tauri::State<'_, ProxyServiceState>,
 ) -> Result<Vec<crate::modules::hub_service::HubDetectionResult>, String> {
     let mut cfg = config::load_app_config();
     if cfg.accounts.is_empty() {
@@ -1682,6 +1686,7 @@ pub async fn detect_all_hub_accounts(
         persist_detection_to_config(&mut cfg, result);
     }
     config::save_app_config(&cfg)?;
+    sync_detected_models_to_cache(&state, &cfg.proxy_accounts, &results).await;
 
     Ok(results)
 }
@@ -1689,6 +1694,7 @@ pub async fn detect_all_hub_accounts(
 #[tauri::command(rename_all = "snake_case")]
 pub async fn hub_checkin_account(
     account_id: String,
+    state: tauri::State<'_, ProxyServiceState>,
 ) -> Result<crate::modules::hub_service::HubCheckinResponse, String> {
     let mut cfg = config::load_app_config();
     let account = find_account_by_id(&cfg, &account_id)?;
@@ -1706,6 +1712,10 @@ pub async fn hub_checkin_account(
 
     if detection.is_some() {
         config::save_app_config(&cfg)?;
+    }
+    if let Some(ref result) = detection {
+        sync_detected_models_to_cache(&state, &cfg.proxy_accounts, std::slice::from_ref(result))
+            .await;
     }
 
     Ok(crate::modules::hub_service::HubCheckinResponse {
@@ -1771,6 +1781,45 @@ async fn populate_proxy_registry_from_cache(
             token_manager.load_models_from_cache(cache).await;
         }
     }
+}
+
+async fn sync_detected_models_to_cache(
+    state: &tauri::State<'_, ProxyServiceState>,
+    proxy_accounts: &[SiteAccount],
+    detections: &[crate::modules::hub_service::HubDetectionResult],
+) {
+    let cache = crate::proxy::model_cache::global();
+    let mut refreshed_account_ids = Vec::new();
+
+    for detection in detections {
+        let models: HashSet<String> = detection
+            .models
+            .iter()
+            .map(|model| model.trim())
+            .filter(|model| !model.is_empty())
+            .map(|model| model.to_string())
+            .collect();
+
+        if models.is_empty() {
+            continue;
+        }
+
+        cache.set_account_models(&detection.account_id, models).await;
+        refreshed_account_ids.push(detection.account_id.clone());
+    }
+
+    if refreshed_account_ids.is_empty() {
+        return;
+    }
+
+    cache.save_to_disk();
+    sync_running_proxy_accounts(state, proxy_accounts).await;
+
+    tracing::info!(
+        refreshed_accounts = refreshed_account_ids.len(),
+        account_ids = ?refreshed_account_ids,
+        "Updated model cache from hub detection results"
+    );
 }
 
 /// Fetch model list from a single account, using the correct endpoint per site type:
