@@ -15,6 +15,15 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 const API_MANAGER_PROXY_PROVIDER_KEY: &str = "apimanagerproxy";
 const API_MANAGER_PROXY_PROVIDER_NAME: &str = "APIManagerProxy";
 const OPENCODE_SCHEMA_URL: &str = "https://opencode.ai/config.json";
+const CLAUDE_DEFAULT_AVAILABLE_MODELS: [&str; 7] = [
+    "default",
+    "opus",
+    "opus[1m]",
+    "opusplan",
+    "sonnet",
+    "sonnet[1m]",
+    "haiku",
+];
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub enum CliApp {
@@ -282,6 +291,50 @@ fn default_model<'a>(models: &'a [String], model: Option<&'a str>) -> Option<&'a
         .first()
         .map(|value| value.as_str())
         .or(model.filter(|value| !value.trim().is_empty()))
+}
+
+fn is_claude_model_name(model: &str) -> bool {
+    let normalized = model.trim().to_ascii_lowercase();
+    normalized.contains("claude") || normalized.contains("anthropic")
+}
+
+fn dedupe_owned_strings(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let owned = trimmed.to_string();
+        if seen.insert(owned.clone()) {
+            result.push(owned);
+        }
+    }
+    result
+}
+
+fn claude_selected_models(models: &[String], fallback_model: Option<&str>) -> Vec<String> {
+    let selected = models
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| is_claude_model_name(value))
+        .map(|value| value.to_string());
+    let fallback = fallback_model
+        .map(str::trim)
+        .filter(|value| is_claude_model_name(value))
+        .map(|value| value.to_string());
+
+    dedupe_owned_strings(selected.chain(fallback))
+}
+
+fn claude_available_models(models: &[String]) -> Vec<String> {
+    dedupe_owned_strings(
+        CLAUDE_DEFAULT_AVAILABLE_MODELS
+            .iter()
+            .map(|value| (*value).to_string())
+            .chain(models.iter().cloned()),
+    )
 }
 
 fn opencode_provider_models(models: &[String], default_model: Option<&str>) -> Map<String, Value> {
@@ -698,24 +751,12 @@ pub fn sync_config(
     Ok(())
 }
 
-/// Helper: set env var if value is Some, remove if None.
-fn set_or_remove(obj: &mut serde_json::Map<String, Value>, key: &str, value: Option<&str>) {
-    match value {
-        Some(v) if !v.is_empty() => {
-            obj.insert(key.to_string(), Value::String(v.to_string()));
-        }
-        _ => {
-            obj.remove(key);
-        }
-    }
-}
-
 /// Generate config content for preview without writing.
 pub fn generate_config_content(
     app: &CliApp,
     proxy_url: &str,
     api_key: &str,
-    claude_models: Option<&ClaudeModelConfig>,
+    _claude_models: Option<&ClaudeModelConfig>,
     model: Option<&str>,
     models: &[String],
     file_name: &str,
@@ -740,6 +781,7 @@ pub fn generate_config_content(
             if json.as_object().is_none() {
                 json = serde_json::json!({});
             }
+            let selected_claude_models = claude_selected_models(models, default_model);
 
             let env = json
                 .as_object_mut()
@@ -764,46 +806,28 @@ pub fn generate_config_content(
                 } else {
                     env_obj.remove("ANTHROPIC_API_KEY");
                 }
-
-                if let Some(cm) = claude_models {
-                    set_or_remove(env_obj, "ANTHROPIC_MODEL", cm.primary_model.as_deref());
-                    set_or_remove(
-                        env_obj,
-                        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-                        cm.haiku_model.as_deref(),
-                    );
-                    set_or_remove(
-                        env_obj,
-                        "ANTHROPIC_DEFAULT_OPUS_MODEL",
-                        cm.opus_model.as_deref(),
-                    );
-                    set_or_remove(
-                        env_obj,
-                        "ANTHROPIC_DEFAULT_SONNET_MODEL",
-                        cm.sonnet_model.as_deref(),
-                    );
-                    set_or_remove(
-                        env_obj,
-                        "ANTHROPIC_REASONING_MODEL",
-                        cm.reasoning_model.as_deref(),
-                    );
-                } else {
-                    env_obj.remove("ANTHROPIC_MODEL");
-                    env_obj.remove("ANTHROPIC_DEFAULT_HAIKU_MODEL");
-                    env_obj.remove("ANTHROPIC_DEFAULT_OPUS_MODEL");
-                    env_obj.remove("ANTHROPIC_DEFAULT_SONNET_MODEL");
-                    env_obj.remove("ANTHROPIC_REASONING_MODEL");
-                }
+                env_obj.remove("ANTHROPIC_MODEL");
+                env_obj.remove("ANTHROPIC_DEFAULT_HAIKU_MODEL");
+                env_obj.remove("ANTHROPIC_DEFAULT_OPUS_MODEL");
+                env_obj.remove("ANTHROPIC_DEFAULT_SONNET_MODEL");
+                env_obj.remove("ANTHROPIC_REASONING_MODEL");
             }
 
             if let Some(root_obj) = json.as_object_mut() {
-                match claude_models.and_then(|config| config.model.as_ref()) {
-                    Some(alias) => {
-                        root_obj.insert("model".to_string(), Value::String(alias.clone()));
+                match selected_claude_models.first() {
+                    Some(model_name) => {
+                        root_obj.insert("model".to_string(), Value::String(model_name.clone()));
+                        root_obj.insert(
+                            "availableModels".to_string(),
+                            Value::Array(
+                                claude_available_models(&selected_claude_models)
+                                    .into_iter()
+                                    .map(Value::String)
+                                    .collect(),
+                            ),
+                        );
                     }
-                    None => {
-                        root_obj.remove("model");
-                    }
+                    None => {}
                 }
             }
 
@@ -1391,6 +1415,73 @@ mod tests {
         let normalized = file.path.to_string_lossy().replace('\\', "/");
         assert!(normalized.ends_with("/.config/opencode/opencode.json"));
         assert_eq!(file.name, "opencode.json");
+    }
+
+    #[test]
+    fn claude_selected_models_keep_exact_model_names() {
+        let models = vec![
+            "gpt-5.2".to_string(),
+            "claude-opus-4-6".to_string(),
+            "claude-sonnet-4-6".to_string(),
+        ];
+
+        let selected = claude_selected_models(&models, Some("claude-opus-4-6"));
+        assert_eq!(
+            selected,
+            vec![
+                "claude-opus-4-6".to_string(),
+                "claude-sonnet-4-6".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_available_models_keep_aliases_and_custom_entries() {
+        let available = claude_available_models(&[
+            "claude-opus-4-6".to_string(),
+            "claude-sonnet-4-6".to_string(),
+        ]);
+
+        assert!(available.iter().any(|value| value == "opus"));
+        assert!(available.iter().any(|value| value == "sonnet"));
+        assert!(available.iter().any(|value| value == "claude-opus-4-6"));
+        assert!(available.iter().any(|value| value == "claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn claude_settings_use_exact_model_and_available_models() {
+        let content = generate_config_content(
+            &CliApp::Claude,
+            "http://127.0.0.1:7887",
+            "sk-test",
+            None,
+            Some("claude-opus-4-6"),
+            &[
+                "claude-opus-4-6".to_string(),
+                "claude-sonnet-4-6".to_string(),
+            ],
+            "settings.json",
+        )
+        .expect("claude config should generate");
+
+        let json: Value = serde_json::from_str(&content).expect("generated config should be json");
+        assert_eq!(json.get("model").and_then(Value::as_str), Some("claude-opus-4-6"));
+
+        let available = json
+            .get("availableModels")
+            .and_then(Value::as_array)
+            .expect("availableModels should exist");
+        assert!(available.iter().any(|value| value.as_str() == Some("opus")));
+        assert!(available
+            .iter()
+            .any(|value| value.as_str() == Some("claude-opus-4-6")));
+        assert!(available
+            .iter()
+            .any(|value| value.as_str() == Some("claude-sonnet-4-6")));
+
+        let env = json.get("env").and_then(Value::as_object).expect("env should exist");
+        assert!(env.get("ANTHROPIC_MODEL").is_none());
+        assert!(env.get("ANTHROPIC_DEFAULT_OPUS_MODEL").is_none());
     }
 
 }

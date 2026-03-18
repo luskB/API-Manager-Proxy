@@ -48,6 +48,16 @@ pub struct BalanceSnapshot {
     pub today_requests_count: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct QuotaDisplaySettings {
+    pub quota_per_unit: Option<f64>,
+    pub display_in_currency: Option<bool>,
+    pub quota_display_type: Option<String>,
+    pub custom_currency_symbol: Option<String>,
+    pub custom_currency_exchange_rate: Option<f64>,
+    pub usd_exchange_rate: Option<f64>,
+}
+
 fn base_url(site_url: &str) -> String {
     site_url.trim_end_matches('/').to_string()
 }
@@ -236,6 +246,28 @@ fn parse_consume_log_items(payload: &Value) -> Vec<Value> {
     }
 
     Vec::new()
+}
+
+fn parse_quota_display_settings(payload: &Value) -> QuotaDisplaySettings {
+    let data = payload.get("data").cloned().unwrap_or_else(|| payload.clone());
+    QuotaDisplaySettings {
+        quota_per_unit: data.get("quota_per_unit").and_then(value_to_f64),
+        display_in_currency: data.get("display_in_currency").and_then(|value| value.as_bool()),
+        quota_display_type: data
+            .get("quota_display_type")
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        custom_currency_symbol: data
+            .get("custom_currency_symbol")
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        custom_currency_exchange_rate: data
+            .get("custom_currency_exchange_rate")
+            .and_then(value_to_f64),
+        usd_exchange_rate: data.get("usd_exchange_rate").and_then(value_to_f64),
+    }
 }
 
 fn is_json_success(payload: &Value) -> bool {
@@ -582,6 +614,23 @@ pub async fn fetch_recent_consume_logs(
     }
 
     Ok(merged)
+}
+
+pub async fn fetch_quota_display_settings(
+    client: &reqwest::Client,
+    account: &SiteAccount,
+) -> Result<QuotaDisplaySettings, String> {
+    let base = base_url(&account.site_url);
+    let headers = build_auth_headers(account.account_info.id, &account.account_info.access_token);
+    let url = format!("{}/api/status", base);
+    let (status, payload) = get_json(client, &url, headers).await?;
+    if !(200..300).contains(&status) {
+        return Err(format!("Fetch status failed (HTTP {})", status));
+    }
+    if !is_json_success(&payload) {
+        return Err(extract_message(&payload).unwrap_or_else(|| "Fetch status failed".to_string()));
+    }
+    Ok(parse_quota_display_settings(&payload))
 }
 
 pub async fn fetch_checkin_status(

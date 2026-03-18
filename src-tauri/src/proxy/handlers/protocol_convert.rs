@@ -39,13 +39,11 @@ pub fn anthropic_to_openai_request(anthropic_body: &Value) -> Value {
                 let content_parts: Vec<Value> = parts
                     .iter()
                     .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
-                    .filter_map(|p| p.get("text").cloned().map(|t| {
-                        let mut part = json!({"type": "text", "text": t});
-                        if let Some(cc) = p.get("cache_control") {
-                            part["cache_control"] = cc.clone();
-                        }
-                        part
-                    }))
+                    .filter_map(|p| {
+                        p.get("text")
+                            .cloned()
+                            .map(|t| json!({"type": "text", "text": t}))
+                    })
                     .collect();
                 if !content_parts.is_empty() {
                     messages.push(json!({"role": "system", "content": content_parts}));
@@ -104,12 +102,15 @@ pub fn anthropic_to_openai_request(anthropic_body: &Value) -> Value {
         let openai_tools: Vec<Value> = tools
             .iter()
             .map(|tool| {
+                let parameters = sanitize_openai_schema(
+                    tool.get("input_schema").cloned().unwrap_or_else(|| json!({})),
+                );
                 json!({
                     "type": "function",
                     "function": {
                         "name": tool.get("name").and_then(|n| n.as_str()).unwrap_or(""),
                         "description": tool.get("description").and_then(|d| d.as_str()).unwrap_or(""),
-                        "parameters": tool.get("input_schema").cloned().unwrap_or(json!({}))
+                        "parameters": parameters
                     }
                 })
             })
@@ -175,20 +176,21 @@ fn convert_user_message(blocks: &[Value], messages: &mut Vec<Value>) {
                 let content = match block.get("content") {
                     Some(Value::String(s)) => s.clone(),
                     Some(Value::Array(parts)) => {
-                        // tool_result content can be an array of content blocks
-                        serde_json::to_string(parts).unwrap_or_default()
+                        // tool_result content can be an array of blocks; preserve only text/images JSON payloads.
+                        let sanitized_parts: Vec<Value> = parts
+                            .iter()
+                            .filter_map(sanitize_content_block_for_openai)
+                            .collect();
+                        serde_json::to_string(&sanitized_parts).unwrap_or_default()
                     }
                     Some(other) => serde_json::to_string(other).unwrap_or_default(),
                     None => String::new(),
                 };
-                let mut tool_msg = json!({
+                let tool_msg = json!({
                     "role": "tool",
                     "content": content,
                     "tool_call_id": tool_use_id
                 });
-                if let Some(cc) = block.get("cache_control") {
-                    tool_msg["cache_control"] = cc.clone();
-                }
                 messages.push(tool_msg);
             }
         }
@@ -197,47 +199,7 @@ fn convert_user_message(blocks: &[Value], messages: &mut Vec<Value>) {
     // Second: collect text + image blocks as user message content
     let text_and_media: Vec<Value> = blocks
         .iter()
-        .filter_map(|block| {
-            let btype = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            match btype {
-                "text" => {
-                    if block.get("text").and_then(|t| t.as_str()).is_some() {
-                        Some(block.clone())
-                    } else {
-                        None
-                    }
-                }
-                "image" => {
-                    // Convert Anthropic image format to OpenAI image_url format
-                    if let Some(source) = block.get("source") {
-                        let source_type =
-                            source.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                        let url = if source_type == "base64" {
-                            let data =
-                                source.get("data").and_then(|d| d.as_str()).unwrap_or("");
-                            let media_type = source
-                                .get("media_type")
-                                .and_then(|m| m.as_str())
-                                .unwrap_or("image/png");
-                            format!("data:{};base64,{}", media_type, data)
-                        } else {
-                            source
-                                .get("url")
-                                .and_then(|u| u.as_str())
-                                .unwrap_or("")
-                                .to_string()
-                        };
-                        Some(json!({
-                            "type": "image_url",
-                            "image_url": {"url": url}
-                        }))
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            }
-        })
+        .filter_map(sanitize_content_block_for_openai)
         .collect();
 
     if !text_and_media.is_empty() {
@@ -306,6 +268,94 @@ fn extract_text(blocks: &[Value]) -> String {
         .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn sanitize_content_block_for_openai(block: &Value) -> Option<Value> {
+    let btype = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    match btype {
+        "text" => block
+            .get("text")
+            .and_then(|t| t.as_str())
+            .map(|text| json!({"type": "text", "text": text})),
+        "image" => {
+            let source = block.get("source")?;
+            let source_type = source.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            let url = if source_type == "base64" {
+                let data = source.get("data").and_then(|d| d.as_str()).unwrap_or("");
+                let media_type = source
+                    .get("media_type")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("image/png");
+                format!("data:{};base64,{}", media_type, data)
+            } else {
+                source
+                    .get("url")
+                    .and_then(|u| u.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            Some(json!({
+                "type": "image_url",
+                "image_url": {"url": url}
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn sanitize_openai_schema(schema: Value) -> Value {
+    match schema {
+        Value::Object(map) => {
+            let mut cleaned = serde_json::Map::new();
+
+            for (key, value) in map {
+                if value.is_null() {
+                    continue;
+                }
+
+                let sanitized = sanitize_openai_schema(value);
+                if sanitized.is_null() {
+                    continue;
+                }
+
+                match key.as_str() {
+                    "required" | "enum" | "anyOf" | "allOf" | "oneOf" => {
+                        if sanitized.is_array() {
+                            cleaned.insert(key, sanitized);
+                        }
+                    }
+                    "properties" => {
+                        if sanitized.is_object() {
+                            cleaned.insert(key, sanitized);
+                        }
+                    }
+                    "items" => {
+                        if !sanitized.is_null() {
+                            cleaned.insert(key, sanitized);
+                        }
+                    }
+                    _ => {
+                        cleaned.insert(key, sanitized);
+                    }
+                }
+            }
+
+            if cleaned.contains_key("properties") && !cleaned.contains_key("type") {
+                cleaned.insert("type".to_string(), Value::String("object".to_string()));
+            }
+
+            Value::Object(cleaned)
+        }
+        Value::Array(items) => {
+            let cleaned: Vec<Value> = items
+                .into_iter()
+                .map(sanitize_openai_schema)
+                .filter(|value| !value.is_null())
+                .collect();
+            Value::Array(cleaned)
+        }
+        other => other,
+    }
 }
 
 /// Map thinking budget_tokens to effort level string.
@@ -1015,6 +1065,64 @@ mod tests {
         assert_eq!(tools[0]["function"]["name"], "read_file");
         assert_eq!(tools[0]["function"]["description"], "Read a file");
         assert!(tools[0]["function"]["parameters"]["properties"]["path"].is_object());
+    }
+
+    #[test]
+    fn tool_schema_null_required_is_removed() {
+        let anthropic = json!({
+            "model": "test",
+            "max_tokens": 10,
+            "tools": [
+                {
+                    "name": "ExitPlanMode",
+                    "description": "Exit planning mode",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {},
+                        "required": null
+                    }
+                }
+            ],
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+
+        let openai = anthropic_to_openai_request(&anthropic);
+        let parameters = &openai["tools"][0]["function"]["parameters"];
+        assert_eq!(parameters["type"], "object");
+        assert!(parameters.get("required").is_none());
+    }
+
+    #[test]
+    fn anthropic_text_blocks_strip_cache_control() {
+        let anthropic = json!({
+            "model": "test",
+            "max_tokens": 10,
+            "system": [
+                {
+                    "type": "text",
+                    "text": "system message",
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "hello",
+                            "cache_control": {"type": "ephemeral"}
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let openai = anthropic_to_openai_request(&anthropic);
+        let system_content = openai["messages"][0]["content"].as_array().unwrap();
+        let user_content = openai["messages"][1]["content"].as_array().unwrap();
+        assert!(system_content[0].get("cache_control").is_none());
+        assert!(user_content[0].get("cache_control").is_none());
     }
 
     #[test]

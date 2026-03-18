@@ -17,8 +17,12 @@ use crate::proxy::handlers::protocol_convert::{
     anthropic_to_openai_request, openai_to_anthropic_response, StreamConverter,
 };
 use crate::proxy::middleware::auth::AuthenticatedKey;
-use crate::proxy::middleware::monitor::UpstreamUrl;
+use crate::proxy::middleware::monitor::{
+    EffectiveAccountId, EffectiveModel, EffectiveRequestBody, UpstreamUrl,
+};
 use crate::proxy::server::AppState;
+
+const FORWARDED_BODY_SNAPSHOT_BYTES: usize = 4096;
 
 /// POST /v1/messages
 ///
@@ -31,10 +35,19 @@ pub async fn handle_messages(
     _headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let (mut response, upstream_url) =
+    let (mut response, upstream_url, effective_model, effective_request_body, effective_account_id) =
         handle_messages_inner(state, auth_key.map(|Extension(key)| key), body).await;
     if let Some(url) = upstream_url {
         response.extensions_mut().insert(UpstreamUrl(url));
+    }
+    if let Some(model) = effective_model {
+        response.extensions_mut().insert(EffectiveModel(model));
+    }
+    if let Some(body) = effective_request_body {
+        response.extensions_mut().insert(EffectiveRequestBody(body));
+    }
+    if let Some(account_id) = effective_account_id {
+        response.extensions_mut().insert(EffectiveAccountId(account_id));
     }
     response
 }
@@ -43,7 +56,13 @@ async fn handle_messages_inner(
     state: AppState,
     auth_key: Option<AuthenticatedKey>,
     body: Bytes,
-) -> (Response, Option<String>) {
+) -> (
+    Response,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
     // Parse the Anthropic request body
     let anthropic_body: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -54,6 +73,9 @@ async fn handle_messages_inner(
                     error_json(&format!("Invalid JSON: {}", e)),
                 )
                     .into_response(),
+                None,
+                None,
+                None,
                 None,
             );
         }
@@ -97,12 +119,21 @@ async fn handle_messages_inner(
                 "This API key is not allowed to access the requested model",
             ),
             None,
+            Some(model.clone()),
+            None,
+            None,
         );
     }
 
     // Convert Anthropic request → OpenAI request
     let openai_body = anthropic_to_openai_request(&anthropic_body);
     let openai_bytes = Bytes::from(serde_json::to_vec(&openai_body).unwrap_or_default());
+    let effective_model = if model.is_empty() {
+        None
+    } else {
+        Some(model.clone())
+    };
+    let effective_request_body = Some(truncate_forwarded_body(&openai_bytes));
 
     // Use OpenAI protocol for upstream selection — all New API sites support /v1/chat/completions
     let mut failed_accounts: Vec<String> = Vec::new();
@@ -118,6 +149,7 @@ async fn handle_messages_inner(
     let (candidate_accounts, has_route_override) =
         merge_account_filters(preferred_route_accounts.clone(), allowed_accounts.as_ref());
     let mut last_site_url: Option<String> = None;
+    let mut last_account_id: Option<String> = None;
 
     if has_route_override
         && candidate_accounts
@@ -131,6 +163,9 @@ async fn handle_messages_inner(
                 "permission_error",
                 "This API key is not allowed to access the selected site",
             ),
+            None,
+            effective_model.clone(),
+            effective_request_body.clone(),
             None,
         );
     }
@@ -187,11 +222,15 @@ async fn handle_messages_inner(
                         &message,
                     ),
                     last_site_url,
+                    effective_model.clone(),
+                    effective_request_body.clone(),
+                    last_account_id.clone(),
                 );
             }
         };
 
         last_site_url = Some(token.site_url.clone());
+        last_account_id = Some(token.account_id.clone());
 
         let mut req_headers = HeaderMap::new();
         req_headers.insert(
@@ -219,9 +258,21 @@ async fn handle_messages_inner(
                     state.token_manager.mark_success(&token.account_id);
 
                     if is_stream {
-                        return (convert_stream_response(resp, &model), last_site_url);
+                        return (
+                            convert_stream_response(resp, &model),
+                            last_site_url,
+                            effective_model.clone(),
+                            effective_request_body.clone(),
+                            Some(token.account_id.clone()),
+                        );
                     }
-                    return (convert_non_stream_response(resp, &model).await, last_site_url);
+                    return (
+                        convert_non_stream_response(resp, &model).await,
+                        last_site_url,
+                        effective_model.clone(),
+                        effective_request_body.clone(),
+                        Some(token.account_id.clone()),
+                    );
                 }
 
                 // Non-2xx: save headers before consuming body
@@ -277,6 +328,9 @@ async fn handle_messages_inner(
                                 &format!("Upstream returned {}", status),
                             ),
                             last_site_url,
+                            effective_model.clone(),
+                            effective_request_body.clone(),
+                            Some(token.account_id.clone()),
                         );
                     }
                     tracing::warn!(
@@ -300,6 +354,9 @@ async fn handle_messages_inner(
                             "All upstream accounts failed authentication",
                         ),
                         last_site_url,
+                        effective_model.clone(),
+                        effective_request_body.clone(),
+                        Some(token.account_id.clone()),
                     );
                 } else if status >= 500 {
                     state.token_manager.mark_failed(&token.account_id);
@@ -312,6 +369,9 @@ async fn handle_messages_inner(
                         &format!("Upstream returned {}", status),
                     ),
                     last_site_url,
+                    effective_model.clone(),
+                    effective_request_body.clone(),
+                    Some(token.account_id.clone()),
                 );
             }
             Err(e) => {
@@ -334,6 +394,9 @@ async fn handle_messages_inner(
                             &format!("Upstream error: {}", e),
                         ),
                         last_site_url,
+                        effective_model.clone(),
+                        effective_request_body.clone(),
+                        Some(token.account_id.clone()),
                     );
                 }
             }
@@ -347,7 +410,19 @@ async fn handle_messages_inner(
             "All retry attempts failed",
         ),
         last_site_url,
+        effective_model,
+        effective_request_body,
+        last_account_id,
     )
+}
+
+fn truncate_forwarded_body(bytes: &Bytes) -> String {
+    let slice = if bytes.len() > FORWARDED_BODY_SNAPSHOT_BYTES {
+        &bytes[..FORWARDED_BODY_SNAPSHOT_BYTES]
+    } else {
+        bytes.as_ref()
+    };
+    String::from_utf8_lossy(slice).into_owned()
 }
 
 /// Convert a successful non-streaming OpenAI response to Anthropic format.

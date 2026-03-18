@@ -1,23 +1,24 @@
-## APIManagerProxy v1.7.4
+## APIManagerProxy v1.7.5
 
-This release focuses on keeping site model catalogs fresh across the app after account detection.
+This release focuses on billing sync accuracy and a smoother monitoring workflow.
 
 ### Highlights
 
-- Hub detection now refreshes proxy model catalogs immediately.
-  After you click **Detect Site**, **Detect All**, or complete a successful check-in with re-detection, the latest model list is written back into the proxy model cache right away.
+- Monitor fee sync now matches more reliably for Claude Code and similar Anthropic-style traffic.
+  When local prompt token counts are missing or reported as `0`, the sync process now prioritizes accurate output-token matches instead of rejecting valid site billing records.
 
-- Proxy key creation now reflects newly added upstream models without waiting for a restart.
-  If a site updated its model catalog from the previous day, the newly detected models will appear in the **allowed models** picker as soon as detection finishes.
+- Synced fee display now follows the site's own billing display rules.
+  If a site reports quota-style values, the monitor converts them using the site's status metadata so the synced amount matches the value shown on the site instead of a raw internal quota number.
 
-- CLI sync model selection stays aligned with the latest detected site models.
-  The CLI model picker now uses the refreshed cache too, so newly published upstream models show up there immediately after detection.
+- Token statistics and dashboard totals now stay aligned after fee sync.
+  Once a monitor entry is synchronized with the site's billing record, downstream aggregate views refresh from the synced cost instead of keeping the older estimate.
 
 ### Included fixes
 
-- Eliminated stale model catalog behavior caused by detection results not updating the proxy-side model cache.
-- Synced refreshed account model data into the running proxy registry so active sessions do not need a restart.
-- Preserved existing detection, check-in, and proxy behavior while improving catalog freshness.
+- Improved Claude Code billing log matching for cases where input tokens are unavailable but output tokens remain accurate.
+- Fixed site-billing amount display for quota-based sites by respecting per-site display settings and exchange metadata.
+- Kept monitor auto-refresh enabled by default and preserved the selected time window mode across navigation.
+- Refined monitor toolbar behavior so fee sync actions fit better into the monitoring workflow.
 
 ### Privacy and packaging
 
@@ -29,7 +30,7 @@ This release focuses on keeping site model catalogs fresh across the app after a
 
 | Platform | Architecture | File |
 | --- | --- | --- |
-| Windows | x64 | `APIManagerProxy_1.7.4_x64-setup.exe` |
-| Windows | x64 | `APIManagerProxy_1.7.4_x64_en-US.msi` |
+| Windows | x64 | `APIManagerProxy_1.7.5_x64-setup.exe` |
+| Windows | x64 | `APIManagerProxy_1.7.5_x64_en-US.msi` |
 | macOS | Apple Silicon / Intel | Built by GitHub Actions |
 | Linux | x64 | Built by GitHub Actions |

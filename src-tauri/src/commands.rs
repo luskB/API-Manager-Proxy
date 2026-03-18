@@ -15,8 +15,6 @@ use crate::proxy::proxy_stats::StatsScope;
 use crate::proxy::server::ProxyServerHandle;
 use crate::proxy::token_manager::{AccountModels, TokenManager};
 
-const SITE_QUOTA_PER_USD: f64 = 500_000.0;
-
 /// Managed state for proxy server lifecycle.
 #[derive(Clone)]
 pub struct ProxyServiceState {
@@ -629,6 +627,8 @@ struct SiteConsumeLogCandidate {
     model_name: Option<String>,
     prompt_tokens: Option<i32>,
     completion_tokens: Option<i32>,
+    use_time_secs: Option<i64>,
+    billing_display: Option<crate::modules::hub_service::QuotaDisplaySettings>,
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -673,6 +673,7 @@ pub async fn sync_log_costs(
     let client = hub_http_client(cfg.proxy.request_timeout)?;
 
     let mut grouped_logs: HashMap<String, Vec<ProxyRequestLog>> = HashMap::new();
+    let mut grouped_site_logs: HashMap<String, Vec<ProxyRequestLog>> = HashMap::new();
     let sync_timestamp = chrono::Utc::now().timestamp();
     let mut updates = Vec::new();
     let mut matched = 0usize;
@@ -681,20 +682,39 @@ pub async fn sync_log_costs(
     let mut synced_log_ids = Vec::new();
 
     for log in target_logs {
-        let Some(account_id) = log.account_id.clone() else {
-            updates.push(BillingSyncUpdate {
-                log_id: log.id.clone(),
-                estimated_cost: None,
-                cost_source: "site_unmatched".to_string(),
-                site_cost_text: None,
-                site_billing: None,
-                billing_synced_at: sync_timestamp,
-            });
+        if let Some(account_id) = log
+            .account_id
+            .clone()
+            .filter(|account_id| account_map.contains_key(account_id))
+        {
+            grouped_logs.entry(account_id).or_default().push(log);
+            continue;
+        }
+
+        let site_key = log
+            .upstream_url
+            .as_deref()
+            .map(normalize_site_key)
+            .filter(|value| !value.is_empty());
+
+        let Some(site_key) = site_key else {
+            updates.push(unmatched_billing_update(&log.id, sync_timestamp));
             unmatched += 1;
             synced_log_ids.push(log.id.clone());
             continue;
         };
-        grouped_logs.entry(account_id).or_default().push(log);
+
+        let has_site_account = account_map
+            .values()
+            .any(|account| normalize_site_key(&account.site_url) == site_key);
+        if !has_site_account {
+            updates.push(unmatched_billing_update(&log.id, sync_timestamp));
+            unmatched += 1;
+            synced_log_ids.push(log.id.clone());
+            continue;
+        }
+
+        grouped_site_logs.entry(site_key).or_default().push(log);
     }
 
     for (account_id, logs) in grouped_logs {
@@ -718,34 +738,26 @@ pub async fn sync_log_costs(
         let page_size = logs.len().clamp(20, 100);
         let max_pages = ((logs.len() / 20).max(1)).clamp(1, 5);
 
-        let site_logs = match hub_service::fetch_recent_consume_logs(
+        let (mut candidates, fetch_failures) = fetch_site_candidates_for_accounts(
             &client,
-            &account,
+            std::slice::from_ref(&account),
             min_timestamp,
             max_timestamp,
             page_size,
             max_pages,
         )
-        .await
-        {
-            Ok(items) => items,
-            Err(error) => {
-                failed_accounts += 1;
-                unmatched += logs.len();
-                tracing::warn!(
-                    account_id = %account_id,
-                    site_name = %account.site_name,
-                    error = %error,
-                    "Failed to synchronize site billing logs"
-                );
-                continue;
-            }
-        };
+        .await;
+        failed_accounts += fetch_failures;
 
-        let mut candidates: Vec<SiteConsumeLogCandidate> = site_logs
-            .into_iter()
-            .filter_map(parse_site_consume_log_candidate)
-            .collect();
+        if candidates.is_empty() {
+            unmatched += logs.len();
+            synced_log_ids.extend(logs.iter().map(|log| log.id.clone()));
+            updates.extend(
+                logs.iter()
+                    .map(|log| unmatched_billing_update(&log.id, sync_timestamp)),
+            );
+            continue;
+        }
 
         let mut account_updates = sync_logs_with_site_candidates(&logs, &mut candidates, sync_timestamp);
         matched += account_updates
@@ -758,6 +770,72 @@ pub async fn sync_log_costs(
             .count();
         synced_log_ids.extend(account_updates.iter().map(|update| update.log_id.clone()));
         updates.append(&mut account_updates);
+    }
+
+    for (site_key, logs) in grouped_site_logs {
+        let site_accounts: Vec<SiteAccount> = account_map
+            .values()
+            .filter(|account| normalize_site_key(&account.site_url) == site_key)
+            .cloned()
+            .collect();
+
+        if site_accounts.is_empty() {
+            unmatched += logs.len();
+            synced_log_ids.extend(logs.iter().map(|log| log.id.clone()));
+            updates.extend(
+                logs.iter()
+                    .map(|log| unmatched_billing_update(&log.id, sync_timestamp)),
+            );
+            continue;
+        }
+
+        let min_timestamp = logs
+            .iter()
+            .map(|log| log.timestamp)
+            .min()
+            .unwrap_or(sync_timestamp)
+            - 180;
+        let max_timestamp = logs
+            .iter()
+            .map(|log| log.timestamp)
+            .max()
+            .unwrap_or(sync_timestamp)
+            + 120;
+        let page_size = logs.len().clamp(20, 100);
+        let max_pages = ((logs.len() / 20).max(1)).clamp(1, 5);
+
+        let (mut candidates, fetch_failures) = fetch_site_candidates_for_accounts(
+            &client,
+            &site_accounts,
+            min_timestamp,
+            max_timestamp,
+            page_size,
+            max_pages,
+        )
+        .await;
+        failed_accounts += fetch_failures;
+
+        if candidates.is_empty() {
+            unmatched += logs.len();
+            synced_log_ids.extend(logs.iter().map(|log| log.id.clone()));
+            updates.extend(
+                logs.iter()
+                    .map(|log| unmatched_billing_update(&log.id, sync_timestamp)),
+            );
+            continue;
+        }
+
+        let mut site_updates = sync_logs_with_site_candidates(&logs, &mut candidates, sync_timestamp);
+        matched += site_updates
+            .iter()
+            .filter(|update| update.cost_source == "site_log")
+            .count();
+        unmatched += site_updates
+            .iter()
+            .filter(|update| update.cost_source == "site_unmatched")
+            .count();
+        synced_log_ids.extend(site_updates.iter().map(|update| update.log_id.clone()));
+        updates.append(&mut site_updates);
     }
 
     mon.apply_billing_updates(&updates);
@@ -1071,7 +1149,71 @@ fn filter_logs_for_window(logs: Vec<ProxyRequestLog>, minutes: Option<u32>) -> V
         .collect()
 }
 
-fn parse_site_consume_log_candidate(item: Value) -> Option<SiteConsumeLogCandidate> {
+async fn fetch_site_candidates_for_accounts(
+    client: &reqwest::Client,
+    accounts: &[SiteAccount],
+    min_timestamp: i64,
+    max_timestamp: i64,
+    page_size: usize,
+    max_pages: usize,
+) -> (Vec<SiteConsumeLogCandidate>, usize) {
+    let mut candidates = Vec::new();
+    let mut failures = 0usize;
+
+    for account in accounts {
+        match hub_service::fetch_recent_consume_logs(
+            client,
+            account,
+            min_timestamp,
+            max_timestamp,
+            page_size,
+            max_pages,
+        )
+        .await
+        {
+            Ok(items) => {
+                let billing_display = hub_service::fetch_quota_display_settings(client, account)
+                    .await
+                    .ok();
+                candidates.extend(
+                    items.into_iter()
+                        .filter_map(|item| parse_site_consume_log_candidate(item, billing_display.clone())),
+                );
+            }
+            Err(error) => {
+                failures += 1;
+                tracing::warn!(
+                    account_id = %account.id,
+                    site_name = %account.site_name,
+                    error = %error,
+                    "Failed to synchronize site billing logs"
+                );
+            }
+        }
+    }
+
+    (candidates, failures)
+}
+
+fn unmatched_billing_update(log_id: &str, sync_timestamp: i64) -> BillingSyncUpdate {
+    BillingSyncUpdate {
+        log_id: log_id.to_string(),
+        estimated_cost: None,
+        cost_source: "site_unmatched".to_string(),
+        site_cost_text: None,
+        site_billing: None,
+        billing_synced_at: sync_timestamp,
+    }
+}
+
+fn normalize_site_key(site_url: &str) -> String {
+    site_url.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+fn parse_site_consume_log_candidate(
+    item: Value,
+    billing_display: Option<crate::modules::hub_service::QuotaDisplaySettings>,
+) -> Option<SiteConsumeLogCandidate> {
     Some(SiteConsumeLogCandidate {
         created_at: value_to_i64(
             item.get("created_at")
@@ -1094,6 +1236,13 @@ fn parse_site_consume_log_candidate(item: Value) -> Option<SiteConsumeLogCandida
                 .or_else(|| item.get("output_tokens"))
                 .or_else(|| item.get("outputTokens")),
         ),
+        use_time_secs: value_to_i64(
+            item.get("use_time")
+                .or_else(|| item.get("useTime"))
+                .or_else(|| item.get("duration"))
+                .or_else(|| item.get("duration_seconds")),
+        ),
+        billing_display,
         raw: item,
     })
 }
@@ -1130,9 +1279,15 @@ fn sync_logs_with_site_candidates(
             let candidate = &candidates[idx];
             updates.push(BillingSyncUpdate {
                 log_id: log.id.clone(),
-                estimated_cost: extract_direct_site_cost_number(&candidate.raw),
+                estimated_cost: extract_direct_site_cost_number(
+                    &candidate.raw,
+                    candidate.billing_display.as_ref(),
+                ),
                 cost_source: "site_log".to_string(),
-                site_cost_text: build_site_cost_text(&candidate.raw),
+                site_cost_text: build_site_cost_text(
+                    &candidate.raw,
+                    candidate.billing_display.as_ref(),
+                ),
                 site_billing: Some(build_site_billing_snapshot(&candidate.raw)),
                 billing_synced_at: sync_timestamp,
             });
@@ -1165,33 +1320,57 @@ fn site_log_match_score(log: &ProxyRequestLog, candidate: &SiteConsumeLogCandida
 
     let mut score = 1_000 - time_diff;
 
-    match (
-        log.input_tokens,
-        candidate.prompt_tokens,
-        log.output_tokens,
-        candidate.completion_tokens,
+    let log_input = token_for_match(log.input_tokens);
+    let site_input = token_for_match(candidate.prompt_tokens);
+    let log_output = token_for_match(log.output_tokens);
+    let site_output = token_for_match(candidate.completion_tokens);
+
+    if let (Some(log_in), Some(site_in)) = (log_input, site_input) {
+        if log_in == site_in {
+            score += 4_000;
+        } else {
+            score -= (log_in - site_in).abs() as i64;
+        }
+    }
+
+    if let (Some(log_out), Some(site_out)) = (log_output, site_output) {
+        let output_diff = (log_out - site_out).abs();
+        if output_diff == 0 {
+            score += 8_000;
+        } else if output_diff <= 2 {
+            score += 1_000 - output_diff as i64;
+        } else {
+            return None;
+        }
+    }
+
+    if matches!(
+        (log_input, site_input, log_output, site_output),
+        (Some(log_in), Some(site_in), Some(log_out), Some(site_out))
+            if log_in == site_in && log_out == site_out
     ) {
-        (Some(log_in), Some(site_in), Some(log_out), Some(site_out)) => {
-            if log_in == site_in && log_out == site_out {
-                score += 10_000;
+        score += 6_000;
+    }
+
+    if log.duration_ms > 0 {
+        if let Some(site_use_time_secs) = candidate.use_time_secs.filter(|value| *value > 0) {
+            let site_duration_ms = site_use_time_secs.saturating_mul(1000);
+            let duration_diff = (log.duration_ms as i64 - site_duration_ms).abs();
+            if duration_diff <= 3_000 {
+                score += 4_000;
+            } else if duration_diff <= 10_000 {
+                score += 1_500;
             } else {
-                score -= ((log_in - site_in).abs() + (log_out - site_out).abs()) as i64;
+                score -= duration_diff / 250;
             }
         }
-        (Some(log_in), Some(site_in), _, _) => {
-            if log_in == site_in {
-                score += 1_000;
-            }
-        }
-        (_, _, Some(log_out), Some(site_out)) => {
-            if log_out == site_out {
-                score += 1_000;
-            }
-        }
-        _ => {}
     }
 
     Some(score)
+}
+
+fn token_for_match(value: Option<i32>) -> Option<i32> {
+    value.filter(|raw| *raw > 0)
 }
 
 fn normalize_monitor_model_name(model: &str) -> String {
@@ -1233,22 +1412,19 @@ fn value_to_string(value: &Value) -> Option<String> {
         .or_else(|| value.as_f64().map(|raw| raw.to_string()))
 }
 
-fn extract_direct_site_cost_number(item: &Value) -> Option<f64> {
-    value_to_f64(
-        item.get("display_cost")
-            .or_else(|| item.get("displayCost"))
-            .or_else(|| item.get("cost"))
-            .or_else(|| item.get("amount")),
-    )
-    .or_else(|| value_to_f64(item.get("quota")).map(|quota| quota / SITE_QUOTA_PER_USD))
+fn extract_direct_site_cost_number(
+    item: &Value,
+    billing_display: Option<&crate::modules::hub_service::QuotaDisplaySettings>,
+) -> Option<f64> {
+    value_to_f64(item.get("display_cost").or_else(|| item.get("displayCost")))
+        .or_else(|| site_display_cost_from_quota(item, billing_display))
 }
 
-fn build_site_cost_text(item: &Value) -> Option<String> {
-    let value = item
-        .get("display_cost")
-        .or_else(|| item.get("displayCost"))
-        .or_else(|| item.get("cost"))
-        .or_else(|| item.get("amount"));
+fn build_site_cost_text(
+    item: &Value,
+    billing_display: Option<&crate::modules::hub_service::QuotaDisplaySettings>,
+) -> Option<String> {
+    let value = item.get("display_cost").or_else(|| item.get("displayCost"));
 
     if let Some(value) = value {
         if let Some(text) = value.as_str() {
@@ -1261,9 +1437,74 @@ fn build_site_cost_text(item: &Value) -> Option<String> {
         return value_to_f64(Some(value)).map(format_site_numeric);
     }
 
-    value_to_f64(item.get("quota"))
-        .map(|quota| quota / SITE_QUOTA_PER_USD)
-        .map(format_site_numeric)
+    match site_display_mode(billing_display) {
+        SiteDisplayMode::Quota => value_to_f64(item.get("quota")).map(format_site_numeric),
+        SiteDisplayMode::Money => site_display_cost_from_quota(item, billing_display).map(format_site_numeric),
+        SiteDisplayMode::Unknown => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SiteDisplayMode {
+    Money,
+    Quota,
+    Unknown,
+}
+
+fn site_display_mode(
+    billing_display: Option<&crate::modules::hub_service::QuotaDisplaySettings>,
+) -> SiteDisplayMode {
+    let Some(settings) = billing_display else {
+        return SiteDisplayMode::Unknown;
+    };
+
+    let kind = settings
+        .quota_display_type
+        .as_deref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_uppercase());
+
+    match kind.as_deref() {
+        Some("TOKEN") | Some("TOKENS") | Some("QUOTA") => SiteDisplayMode::Quota,
+        Some("USD") | Some("CNY") | Some("CUSTOM") => SiteDisplayMode::Money,
+        Some(_) => {
+            if settings.display_in_currency.unwrap_or(false) {
+                SiteDisplayMode::Money
+            } else {
+                SiteDisplayMode::Quota
+            }
+        }
+        None => {
+            if settings.display_in_currency.unwrap_or(false) {
+                SiteDisplayMode::Money
+            } else {
+                SiteDisplayMode::Unknown
+            }
+        }
+    }
+}
+
+fn site_display_cost_from_quota(
+    item: &Value,
+    billing_display: Option<&crate::modules::hub_service::QuotaDisplaySettings>,
+) -> Option<f64> {
+    let settings = billing_display?;
+    let quota = value_to_f64(item.get("quota"))?;
+    let quota_per_unit = settings.quota_per_unit.filter(|value| *value > 0.0)?;
+    let usd_value = quota / quota_per_unit;
+
+    let kind = settings
+        .quota_display_type
+        .as_deref()
+        .map(|value| value.trim().to_ascii_uppercase());
+
+    match kind.as_deref() {
+        Some("CNY") => Some(usd_value * settings.usd_exchange_rate.unwrap_or(1.0)),
+        Some("CUSTOM") => Some(usd_value * settings.custom_currency_exchange_rate.unwrap_or(1.0)),
+        Some("TOKEN") | Some("TOKENS") | Some("QUOTA") => None,
+        _ => Some(usd_value),
+    }
 }
 
 fn format_site_numeric(value: f64) -> String {
@@ -2228,7 +2469,7 @@ mod tests {
             "prompt_tokens": 128,
             "completion_tokens": 64,
             "quota": 50000
-        }))
+        }), None)
         .unwrap();
         let bad = parse_site_consume_log_candidate(json!({
             "created_at": 1_700_000_001,
@@ -2236,16 +2477,101 @@ mod tests {
             "prompt_tokens": 512,
             "completion_tokens": 128,
             "quota": 99999
-        }))
+        }), None)
         .unwrap();
 
         assert!(site_log_match_score(&log, &good).unwrap() > site_log_match_score(&log, &bad).unwrap());
     }
 
     #[test]
-    fn build_site_cost_text_converts_quota_units_to_site_cost_display() {
+    fn site_log_match_handles_cached_prompt_token_differences() {
+        let log = make_proxy_log("claude-opus-4-6", 1_773_839_524, 24_251, 447);
+        let cached = parse_site_consume_log_candidate(json!({
+            "created_at": 1_773_839_527i64,
+            "model_name": "claude-opus-4-6",
+            "prompt_tokens": 26_552,
+            "completion_tokens": 447,
+            "quota": 36_271
+        }), None)
+        .unwrap();
+        let unrelated = parse_site_consume_log_candidate(json!({
+            "created_at": 1_773_839_169i64,
+            "model_name": "claude-opus-4-6",
+            "prompt_tokens": 100,
+            "completion_tokens": 76,
+            "quota": 600
+        }), None)
+        .unwrap();
+
+        assert!(
+            site_log_match_score(&log, &cached).unwrap()
+                > site_log_match_score(&log, &unrelated).unwrap()
+        );
+    }
+
+    #[test]
+    fn site_log_match_prefers_exact_output_when_input_tokens_are_zero() {
+        let log = make_proxy_log("claude-opus-4-6", 1_773_841_851, 0, 71);
+        let exact_output = parse_site_consume_log_candidate(
+            json!({
+                "created_at": 1_773_841_854i64,
+                "model_name": "claude-opus-4-6",
+                "prompt_tokens": 6_504,
+                "completion_tokens": 71,
+                "quota": 11_325,
+                "use_time": 12
+            }),
+            None,
+        )
+        .unwrap();
+        let wrong_output = parse_site_consume_log_candidate(
+            json!({
+                "created_at": 1_773_841_863i64,
+                "model_name": "claude-opus-4-6",
+                "prompt_tokens": 184,
+                "completion_tokens": 84,
+                "quota": 4_307,
+                "use_time": 8
+            }),
+            None,
+        )
+        .unwrap();
+
+        assert!(site_log_match_score(&log, &exact_output).is_some());
+        assert!(site_log_match_score(&log, &wrong_output).is_none());
+    }
+
+    fn usd_display_settings() -> crate::modules::hub_service::QuotaDisplaySettings {
+        crate::modules::hub_service::QuotaDisplaySettings {
+            quota_per_unit: Some(500_000.0),
+            display_in_currency: Some(true),
+            quota_display_type: Some("USD".to_string()),
+            custom_currency_symbol: None,
+            custom_currency_exchange_rate: None,
+            usd_exchange_rate: Some(7.3),
+        }
+    }
+
+    #[test]
+    fn build_site_cost_text_uses_site_status_display_settings() {
         let raw = json!({ "quota": 50000 });
-        assert_eq!(build_site_cost_text(&raw).as_deref(), Some("0.1"));
-        assert_eq!(extract_direct_site_cost_number(&raw), Some(0.1));
+        let settings = usd_display_settings();
+        assert_eq!(build_site_cost_text(&raw, Some(&settings)).as_deref(), Some("0.1"));
+        assert_eq!(extract_direct_site_cost_number(&raw, Some(&settings)), Some(0.1));
+    }
+
+    #[test]
+    fn build_site_cost_text_respects_cny_exchange_rate() {
+        let raw = json!({ "quota": 50000 });
+        let settings = crate::modules::hub_service::QuotaDisplaySettings {
+            quota_per_unit: Some(500_000.0),
+            display_in_currency: Some(true),
+            quota_display_type: Some("CNY".to_string()),
+            custom_currency_symbol: None,
+            custom_currency_exchange_rate: None,
+            usd_exchange_rate: Some(7.3),
+        };
+        assert_eq!(build_site_cost_text(&raw, Some(&settings)).as_deref(), Some("0.73"));
+        assert_eq!(extract_direct_site_cost_number(&raw, Some(&settings)), Some(0.73));
     }
 }
